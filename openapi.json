@@ -1,0 +1,558 @@
+{
+  "components": {
+    "schemas": {
+      "CreateRunRequest": {
+        "properties": {
+          "spec_id": {
+            "title": "Spec Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "spec_id"
+        ],
+        "title": "CreateRunRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "const": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "RunCreatedResponse": {
+        "properties": {
+          "phase": {
+            "title": "Phase",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "phase"
+        ],
+        "title": "RunCreatedResponse",
+        "type": "object"
+      },
+      "RunStatusResponse": {
+        "properties": {
+          "expected_case_count": {
+            "title": "Expected Case Count",
+            "type": "integer"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "interrupt": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interrupt"
+          },
+          "phase": {
+            "title": "Phase",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "settled_case_count": {
+            "title": "Settled Case Count",
+            "type": "integer"
+          },
+          "spec_fingerprint": {
+            "title": "Spec Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "phase",
+          "spec_fingerprint",
+          "expected_case_count",
+          "settled_case_count"
+        ],
+        "title": "RunStatusResponse",
+        "type": "object"
+      },
+      "SpecCreatedResponse": {
+        "properties": {
+          "declared_targets": {
+            "description": "从 servers 提取的出站目标，值为 `scheme://host:port`。为空意味着所有请求都会被 Guardrail 拒绝。",
+            "items": {
+              "type": "string"
+            },
+            "title": "Declared Targets",
+            "type": "array"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "openapi_version": {
+            "title": "Openapi Version",
+            "type": "string"
+          },
+          "operation_count": {
+            "title": "Operation Count",
+            "type": "integer"
+          },
+          "reused": {
+            "description": "指纹命中已有 Spec 时为 true——**没有重新解析、没有重复落库**",
+            "title": "Reused",
+            "type": "boolean"
+          },
+          "spec_id": {
+            "title": "Spec Id",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/WarningItem"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "spec_id",
+          "fingerprint",
+          "openapi_version",
+          "operation_count",
+          "declared_targets",
+          "reused"
+        ],
+        "title": "SpecCreatedResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WarningItem": {
+        "description": "解析期间的降级提示（`05` §4.1）。\n\n**不可省略**：`SpecParser` 的降级情形（相对 URL、无 `servers`、`$ref` 超深）\n必须在这里告知用户——否则用户后续看到 `blocked_by_policy` 归因时，\n会以为是平台故障，而真正的原因在解析阶段就被掩盖了。",
+        "properties": {
+          "code": {
+            "description": "机器可读的提示码，如 `relative_server_url`",
+            "title": "Code",
+            "type": "string"
+          },
+          "detail": {
+            "description": "给人读的说明",
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "detail"
+        ],
+        "title": "WarningItem",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "基于多智能体编排的 API 自动化测试平台。\n\n**接口契约以代码为准**（ADR-0023）：这份文档由 FastAPI 从路由与 Pydantic 模型自动生成，`openapi.json` 是它的产物而非来源。",
+    "title": "TestFlow",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/runs": {
+      "post": {
+        "description": "创建 Run 并投递推进指令。\n\n**503 而不是静默成功**：队列不可用时返回 503（`05` §4.2）。\n返回 202 而实际什么都没投递，会让用户等一个永远不会开始的 Run——\n那比\"明确失败\"糟得多。",
+        "operationId": "create_run_api_runs_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunCreatedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "发起一次测试运行",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}": {
+      "get": {
+        "operationId": "get_run_api_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "查询运行状态",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/events": {
+      "get": {
+        "description": "SSE 事件流。**只传信号，不传数据**（API7）。\n\n设计上的一条硬约束：事件里只有\"阶段变了\"这种信号，**没有用例内容、\n没有响应体**。两条理由：\n\n* 数据走两条路会立刻产生\"哪个是权威\"的问题——而 REST 是权威\n* SSE 连接可能很长，把数据塞进去意味着它会被缓存在中间层\n  （代理、浏览器），而那些缓存不受我们的留存策略管辖\n\n## ⚠️ M1 的实现方式：**短间隔轮询数据库**\n\n真正的\"事件推送\"要求 Gateway 知道编排器/Worker 侧的进展，而那需要一条\n跨进程的事件总线。M1 没有它——所以这里按固定间隔查 `runs` 表，\n阶段变了就发一条事件。\n\n**这是一个偏差，要记录在案**：延迟是轮询间隔的量级（秒），\n而真推送是毫秒。代价换来的是不引入一套总线——Redis pub/sub 会因为\n断线丢消息，而\"REST 是权威\"这条退路让我们**丢了消息也不影响正确性**，\n只是晚一点收到通知。",
+        "operationId": "stream_events_api_runs__run_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "SSE 事件流。事件里**只有信号，没有数据**（API7）：`run.phase` / `run.completed` / `run.failed` / 心跳注释。"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "运行事件流（SSE）",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/report": {
+      "get": {
+        "description": "按 `Accept` 返回 JSON 或 Markdown。\n\nMarkdown 返回的是**写入时的快照**，不是重新渲染（RA4）：\n报告会被引用（评审材料、问题工单），三个月前那份应当保持原样——\n\"当时看到的\"和\"现在查到的\"必须一致。",
+        "operationId": "get_report_api_runs__run_id__report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              },
+              "text/markdown": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "报告内容。`application/json` 返回结构化数据，`text/markdown` 返回写入时的渲染快照（RA4）。"
+          },
+          "404": {
+            "description": "报告尚未生成（`problem+json`，`code=report_not_ready`）"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "取报告（JSON 或 Markdown）",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/specs": {
+      "post": {
+        "description": "解析并保存一份 OpenAPI 文档。\n\n**幂等（DM2）**：同一份内容重复提交不会重复解析——指纹命中已有 Spec 时\n直接复用（`reused=true`），不重新落 `operations`。\n\n**硬失败 vs 降级（SP4）**：语法错误、不合规、悬空 `$ref` 返回 400；\n而\"信息不全\"（相对 URL、没有 `servers`）**降级继续**并在 `warnings`\n里说明——用户能修的必须让他修，不能修的尽力而为并如实标注。",
+        "operationId": "upload_spec_api_specs_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpecCreatedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "提交 OpenAPI 文档",
+        "tags": [
+          "specs"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "description": "**只报告\"进程活着\"，不报告\"依赖可达\"。**\n\n这条区分很重要：如果它去连数据库，那么数据库抖动时 Gateway 会被\n健康检查判死并重启——而重启一个正常的进程解决不了数据库的问题，\n只会让正在处理的请求全部中断。\n\n依赖的连通性由**启动期自检**与运维监控负责，不是这条端点。",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "存活检查",
+        "tags": [
+          "ops"
+        ]
+      }
+    }
+  }
+}

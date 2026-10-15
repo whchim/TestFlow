@@ -1,0 +1,172 @@
+name: testflow
+
+# 单机部署基线（PRD §5 / 10-部署运维.md §1）。
+#
+# 当前只含基础设施。四个应用服务（gateway / orchestrator / worker / beat，
+# 见 10 §2.1）在 M1 加入——它们需要 Dockerfile 与可运行的代码。
+
+
+x-app-env: &app-env
+  TESTFLOW_DATABASE_URL: postgresql+psycopg://testflow:testflow@postgres:5432/testflow
+  TESTFLOW_REDIS_URL: redis://redis:6379
+  # 内部令牌用于**唤醒端点**与 Worker 的图推进通知。它比用户令牌权限更高
+  # （05 §5.3），所以这里用一个明显不同的值——生产部署必须另行注入。
+  TESTFLOW_INTERNAL_TOKEN: dev-internal-token
+  TESTFLOW_CREDENTIAL_ENCRYPTION_KEY: ${TESTFLOW_CREDENTIAL_ENCRYPTION_KEY:?必须设置凭证加密密钥}
+  TESTFLOW_LLM_BASE_URL: ${TESTFLOW_LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+  TESTFLOW_LLM_API_KEY: ${TESTFLOW_LLM_API_KEY:-not-configured}
+  # ★ 内网例外：**唯一的来源是这里**，永不从 Spec 派生（ADR-0018）。
+  # 含 `fixture:9000` 是因为 demo 的被测对象在容器网络里——
+  # 这正好让"例外机制"被日常使用，比专门为它写一条测试有力得多。
+  TESTFLOW_GUARDRAIL_ALLOW_PRIVATE_TARGETS: '["fixture:9000"]'
+  TESTFLOW_LOG_LEVEL: INFO
+
+services:
+  postgres:
+    # PostgreSQL 18 提供原生 uuidv7()，避免应用侧生成时间有序 UUID
+    # （04 DM8 允许两种，原生更好：索引局部性由数据库保证）。
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: testflow
+      POSTGRES_PASSWORD: testflow
+      POSTGRES_DB: testflow
+      TZ: UTC
+    ports:
+      # ⚠️ 对 10 OP2 的细化，见下方注释块
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # ⚠️ 挂载点是 /var/lib/postgresql，**不是** /var/lib/postgresql/data。
+      # PostgreSQL 18 的官方镜像改了数据目录布局：改用按主版本分的子目录
+      # （实际数据落在 /var/lib/postgresql/18/docker），目的是让 pg_upgrade
+      # 能跨版本工作而不受挂载点边界影响。
+      # 沿用旧路径会让容器直接拒绝启动：
+      #   "there appears to be PostgreSQL data in: /var/lib/postgresql/data
+      #    (unused mount/volume)"
+      # 见 https://github.com/docker-library/postgres/pull/1259
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testflow -d testflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # OP7：Redis 的数据是可丢弃的（Checkpoint 丢了可从 PG 重跑，
+    # 见 ADR-0009），因此**刻意关闭持久化**——不为可丢的数据付持久化成本。
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # fixture 是**测试专用**的被测对象（09 §3.2）。它与应用服务在同一个网络里，
+  # 所以 Worker 能直接访问它——而这也是"内网目标"最真实的形态：
+  # 它必须被显式列入 `guardrail_allow_private_targets` 才能被访问（ADR-0018）。
+  fixture:
+    build: .
+    command: ["testflow-fixture"]
+    environment:
+      # 让 fixture 监听所有接口，否则容器外（同一网络的其他容器）连不上——
+      # 它默认绑环回，那是**安全默认**，这里为了演示显式放开。
+      FIXTURE_HOST: "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9000/ok')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  gateway:
+    build: .
+    command: ["testflow-gateway"]
+    environment:
+      <<: *app-env
+      TESTFLOW_BIND_HOST: "0.0.0.0"
+      # 绑非环回时**必须**有用户令牌（config.py 的启动期校验会拒绝启动）。
+      TESTFLOW_API_TOKEN: dev-api-token
+    ports:
+      # 只发布到环回——与 OP2 的口径一致（10 §4）。
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  orchestrator:
+    build: .
+    command: ["testflow-orchestrator"]
+    environment: *app-env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["testflow-worker"]
+    environment:
+      <<: *app-env
+      # Worker 要打 Gateway 的内部端点。容器里 `127.0.0.1` 是它自己，
+      # 所以必须显式指向服务名——这一条漏了的表现是"唤醒永远失败，
+      # Run 只能靠兜底轮询收尾"，而日志里只有一个连不上的警告。
+      TESTFLOW_GATEWAY_URL: http://gateway:3000
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      gateway: {condition: service_healthy}
+    restart: unless-stopped
+
+  beat:
+    build: .
+    command: ["testflow-beat"]
+    environment: *app-env
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  # 迁移是一个**一次性任务**，不是服务。
+  # 违背 OP6（启动时不自动建表）的常见做法是让 gateway 启动时跑 alembic——
+  # 那会让多个副本同时迁移，且"服务起不来"与"迁移失败"变成同一个现象。
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres: {condition: service_healthy}
+    profiles: ["tools"]  # 只有显式指定时才跑：`docker compose --profile tools run migrate`
+
+volumes:
+  pgdata:
+    # 唯一必须备份的卷（07 NF5 / 10 OP3）：PG 是唯一事实来源。
+
+# ─────────────────────────────────────────────────────────────────────────
+# 关于端口绑定：对 10 OP2 的细化
+#
+# OP2 的原文是「PostgreSQL 与 Redis **不发布**端口」，理由是"调试用 exec 进
+# 容器，不开端口"，防的是 `0.0.0.0` 把这两个服务（含全部用例、结果、审计
+# 日志与加密凭证）暴露到局域网。
+#
+# 此处绑定的是 `127.0.0.1`——**只有本机能连，局域网连不上**，与 OP2 要防的
+# 风险不同。而它换来的是开发期的实际便利：迁移、调试、psql 都可以直接在
+# 宿主机上跑，不必每次 `docker compose exec`。
+#
+# 判断：保持"不暴露到网络"的意图，放宽"完全不发布端口"的字面。
+# 若后续要把 10 OP2 改成这个口径，需同步更新该文档。
+# ─────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────── 应用服务（M1）
+#
+# 一个镜像跑四个进程，区别只在启动命令（10 §2.1）。它们共用同一份
+# 环境变量块——用一个 YAML 锚点（`x-app-env`）表达，避免四处复制粘贴，
+# 而复制粘贴的环境变量块迟早会漏掉一项，且缺失的表现是运行期才炸。

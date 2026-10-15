@@ -1,0 +1,74 @@
+"""Celery Beat 入口。**只投递，不执行**（OP9）。
+
+对应决策：`10-部署运维.md` §7、`06-Agent编排.md` §6.4。
+
+## 为什么需要这个入口点
+
+`08` §1 的脚注说"beat 无入口点，由 `celery -A testflow beat` 启动"。
+但 `-A` 需要一个**模块级的 app 实例**，而在导入时构造 app 意味着
+在导入时读配置——违反 EN3（配置只由 `load_settings()` 显式构造）。
+
+所以加了这个入口点。代价是一个文件；收益是配置注入的规则没有例外。
+（入口点本身被排除在覆盖率要求之外，见 `08` §2.3。）
+
+## 定时任务只有一个
+
+| 任务 | 间隔 | 作用 |
+| :--- | :--- | :--- |
+| `testflow.fallback_poll` | 1 分钟 | 找回因回调丢失而悬空的 Run |
+
+M5 还会加清理与备份两项（`10` §7），但 M1 只需要这一个——
+**它是"丢了回调图仍能推进"那条验收的唯一保障。**
+"""
+
+from __future__ import annotations
+
+import sys
+
+from celery.schedules import crontab
+
+from testflow.celery_app import ORCHESTRATE_QUEUE, build_celery_app
+from testflow.config import load_settings
+from testflow.observability.logging import configure_logging, get_logger
+
+__all__ = ["build_beat_app", "main"]
+
+logger = get_logger(__name__)
+
+
+def build_beat_app(settings=None):
+    settings = settings or load_settings()
+    app = build_celery_app(settings, include=["testflow.graph.tasks_beat"])
+
+    app.conf.beat_schedule = {
+        "fallback-poll": {
+            "task": "testflow.fallback_poll",
+            "schedule": crontab(minute="*"),  # 每分钟
+            "options": {"queue": ORCHESTRATE_QUEUE},
+        }
+    }
+    return app
+
+
+def main() -> None:
+    settings = load_settings()
+    configure_logging(settings.log_level)
+    app = build_beat_app(settings)
+
+    app.start(
+        argv=[
+            "beat",
+            # 持久化调度状态：不持久化的话，beat 重启会让"下一次执行时间"
+            # 从头算，于是一次重启可能推迟一整轮扫描——而那正好发生在
+            # "有 Run 悬空、正等兜底"的时候。
+            "--schedule",
+            "/tmp/testflow-celerybeat-schedule",
+            "--loglevel",
+            settings.log_level,
+        ]
+    )
+    sys.exit(0)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

@@ -1,0 +1,130 @@
+[project]
+name = "testflow"
+version = "0.1.0"
+description = "基于多智能体编排的 API 自动化测试平台"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+
+dependencies = [
+    # Web
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # 配置与校验
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    # 存储
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+    "redis>=5.0",
+    # 任务队列与编排
+    "celery>=5.4",
+    "langgraph>=0.2",
+    # 出站（仅允许在 guardrail/ 与 llm/ 中 import，见 08 §2.2）
+    "httpx>=0.27",
+    "openai>=1.50",
+    # Spec 解析
+    "prance>=23.6",
+    "openapi-spec-validator>=0.7",
+    # 断言引擎（execution/assertions.py）
+    # jsonpath-ng 用于 json_path 断言取值；jsonschema 用于 schema_valid 断言。
+    # 二者都是直接 import，因此必须显式声明——即使 jsonschema 是
+    # openapi-spec-validator 的传递依赖，依赖传递随时可能变，
+    # 直接 import 的东西必须直接声明（否则某天上游换实现就会突然炸）。
+    "jsonpath-ng>=1.7",
+    "jsonschema>=4.20",
+    # 报告与配置
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    # 凭证加密（SR-6）
+    "cryptography>=43.0",
+]
+
+[project.scripts]
+testflow = "testflow.entrypoints.cli:main"
+testflow-gateway = "testflow.entrypoints.gateway:main"
+testflow-orchestrator = "testflow.entrypoints.orchestrator:main"
+testflow-worker = "testflow.entrypoints.worker:main"
+testflow-beat   = "testflow.entrypoints.beat:main"
+# fixture 服务：端到端测试的可控被测对象（09 §3.2）。仅用于测试，不部署。
+testflow-fixture = "testflow.testing.fixture_server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "pip-audit>=2.7",
+    "types-pyyaml",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/testflow"]
+
+# ---------------------------------------------------------------- 工具配置
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# 不扫描 docs/：ruff 会格式化 Markdown 代码块里的 Python 示例，
+# 而文档中的示例应当由作者控制格式——工具改写会让示例与正文的排版脱节。
+#
+# 必须用 `extend-exclude` 而非 `exclude`：后者是**替换**默认排除列表，
+# 会把 .venv / __pycache__ 等一起放进来。（这个坑真踩了一次：写 `exclude`
+# 之后 ruff 跑去格式化了 .venv 里的 3765 个第三方文件。）
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PTH"]
+# 与 ADR-0002 相关：HTTP 客户端的 import 限制由 tests/architecture/ 检查，
+# 不在此处用 ruff 规则实现——那里能给出更明确的失败信息。
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic 自动生成的迁移：里面的 CHECK 约束是一条完整的 SQL 字符串，
+# 拆行反而更难读。其余行宽仍由 ruff format 保证。
+"src/testflow/storage/migrations/versions/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: 需要 PostgreSQL / Redis / 容器（Docker 未就绪时跳过）",
+]
+
+[tool.coverage.run]
+source = ["src/testflow"]
+branch = true
+omit = [
+    # 声明式模型没有可执行逻辑——行覆盖率对它们是噪声（类体被执行一次就"满分"，
+    # 而这不能说明任何事）。它们的正确性由 `alembic check` 验证：
+    # 模型与迁移必须一致，那是比行覆盖更有力的检查。
+    "src/testflow/storage/models.py",
+    # 进程入口只做装配。08 §2.3 明确把 entrypoints/ 列入"可不追求"覆盖——
+    # 为装配代码写凑数的测试，收益低于维护成本。
+    "src/testflow/entrypoints/*",
+    # Alembic 环境脚本由 alembic 自己执行，不经过 pytest。
+    "src/testflow/storage/migrations/*",
+]
+
+[tool.coverage.report]
+# 分层覆盖率（09 §2.3 TS2）：
+#   guardrail/policy、execution/assertions、agents/rules 目标 >= 90%
+#   整体目标 >= 70%（PRD M6）
+# CI 中对前三者单独设阈值，此处只保证整体不倒退。
+fail_under = 0
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+# 领域模型与模块边界处严格；不追求全量 strict（08 §4.1）

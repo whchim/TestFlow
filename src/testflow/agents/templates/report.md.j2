@@ -1,0 +1,50 @@
+# 测试报告
+
+| 项 | 值 |
+| :--- | :--- |
+| Run | `{{ content.run_id }}` |
+| Spec 指纹 | `{{ content.spec_fingerprint[:16] }}…` |
+
+## 通过率
+
+**{{ rate }}**
+
+分母只含**已执行**的用例（`passed + failed + timeout + error`）。
+未执行、被跳过的用例不参与计算——否则"我们没跑的"会稀释通过率，
+把一个真实的失败率说小。
+
+| 状态 | 条数 |
+| :--- | ---: |
+| 已执行 | {{ content.summary.executed }} |
+| 通过 | {{ content.summary.passed }} |
+| 失败 | {{ content.summary.failed }} |
+| 超时 | {{ content.summary.timeout }} |
+| 错误 | {{ content.summary.error }} |
+| **未执行** | {{ content.summary.skipped }} |
+| 用例总数 | {{ content.summary.total_cases }} |
+
+## 失败清单
+
+{% if content.failures %}
+| 用例 | 维度 | 状态 | HTTP | 期望 | 实际 |
+| :--- | :--- | :--- | ---: | :--- | :--- |
+{% for item in content.failures -%}
+| {{ item.case_name }} | `{{ item.dimension }}` | {{ item.status }} | {{ item.http_status or "—" }} | {{ item.expected or "—" }} | {{ item.actual or "—" }} |
+{% endfor %}
+{% else %}
+没有失败的用例。
+{% endif %}
+
+## 未执行的用例
+
+{% if content.skipped %}
+以下用例**没有执行**，因此它们的通过与否是未知的：
+
+| 用例 | 原因 |
+| :--- | :--- |
+{% for item in content.skipped -%}
+| {{ item.case_name }} | `{{ item.reason }}` |
+{% endfor %}
+{% else %}
+全部用例都已执行。
+{% endif %}
