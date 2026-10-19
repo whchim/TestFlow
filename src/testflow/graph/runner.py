@@ -76,6 +76,8 @@ class GraphDeps:
     report_builder: ReportBuilder
     #: 阶段 B 的生成器。`None` 时用纯规则生成器（离线路径）。
     case_generator: Any = None
+    #: N6 的归因器。`None` 时 N6 只跑规则（`unknown` 会变多）。
+    failure_analyzer: Any = None
 
 
 def build_graph(checkpointer: RedisCheckpointSaver, deps: GraphDeps) -> Any:
@@ -90,11 +92,12 @@ def build_graph(checkpointer: RedisCheckpointSaver, deps: GraphDeps) -> Any:
 
     ## 关于 IP-1
 
-    链上**没有** IP-1 节点（`06` §4 的图里有）。M1 明确不做人工确认门——
-    N3 无条件批准全部用例。M2 会把它插在 `generate_cases` 与
-    `apply_decisions` 之间。
+    IP-1 是插在 `generate_cases` 与 `apply_decisions` 之间的**独立节点**
+    （`review_gate`）——与 IP-2（`wait_for_results`）同理：`interrupt()`
+    独占一个节点，被中断的节点在恢复时从头重跑（实测确认），
+    所以它不能和 N2/N3 的生成或决策逻辑混在同一个节点里。
 
-    这是一个**图结构变更**：旧 checkpoint 无法在新图上恢复。
+    相比 M1，这是一次**图结构变更**：旧 checkpoint 无法在新图上恢复。
     `10` §8 允许停机升级，所以 M1→M2 的升级是一次停机操作。
     """
     session_holder: dict[str, Session] = {}
@@ -106,6 +109,8 @@ def build_graph(checkpointer: RedisCheckpointSaver, deps: GraphDeps) -> Any:
         "generate_cases",
         _with_session(N.generate_cases, session_holder, generator=deps.case_generator),
     )
+    # ★ IP-1：与 IP-2 一样，整个节点体就是一次 `interrupt`，必须是独立节点。
+    graph.add_node("review_gate", _with_session(N.review_gate, session_holder))
     graph.add_node("apply_decisions", _with_session(N.apply_decisions, session_holder))
     graph.add_node(
         "dispatch_cases",
@@ -116,7 +121,10 @@ def build_graph(checkpointer: RedisCheckpointSaver, deps: GraphDeps) -> Any:
     # 会让那个节点的全部逻辑跟着重跑一遍。
     graph.add_node("wait_for_results", _with_session(N.wait_for_results, session_holder))
     graph.add_node("collect_results", _with_session(N.collect_results, session_holder))
-    graph.add_node("analyze_failures", _with_session(N.analyze_failures, session_holder))
+    graph.add_node(
+        "analyze_failures",
+        _with_session(N.analyze_failures, session_holder, analyzer=deps.failure_analyzer),
+    )
     graph.add_node(
         "build_report",
         _with_session(N.build_report, session_holder, builder=deps.report_builder),
@@ -127,8 +135,9 @@ def build_graph(checkpointer: RedisCheckpointSaver, deps: GraphDeps) -> Any:
         "parse_spec", after_parse, {"generate_cases": "generate_cases", "__end__": END}
     )
     graph.add_conditional_edges(
-        "generate_cases", after_generate, {"apply_decisions": "apply_decisions", "__end__": END}
+        "generate_cases", after_generate, {"review_gate": "review_gate", "__end__": END}
     )
+    graph.add_edge("review_gate", "apply_decisions")
     graph.add_conditional_edges(
         "apply_decisions", after_decisions, {"dispatch_cases": "dispatch_cases", "__end__": END}
     )
@@ -198,8 +207,8 @@ async def advance(
     """把一个 Run 推进到下一个中断点。
 
     Args:
-        reason: 唤醒来源，用于日志。取值如 `results_ready` / `fallback_poll`。
-            它**不影响行为**——两种来源做的是同一件事。
+        reason: 唤醒来源，用于日志。取值如 `results_ready` / `fallback_poll` /
+            `decisions_submitted`。它**不影响行为**——不同来源做的是同一件事。
 
     Returns:
         做了什么。取值：`started` / `resumed` / `lock_held` / `terminal` / `failed`。

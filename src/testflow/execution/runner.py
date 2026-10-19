@@ -324,24 +324,34 @@ def run_case(
     policy: EgressPolicy,
     settings: Settings,
     load_credential: Callable[[str], CredentialMaterial | None] | None = None,
-    wake: WakeCallback | None = None,
 ) -> CaseOutcome:
-    """Worker 侧的完整流程：读 → 执行 → 落库 → 回调。
+    """Worker 侧的完整流程：读 → 执行 → 落库（flush）。
 
-    **调用方负责事务边界。** 本函数只 flush，不 commit——`commit` 是一个
-    跨越"数据库"与"消息队列"两个系统的决定（先落库再回调，见 D4），
-    把它藏在执行函数里会让那个顺序无处可见。
+    **调用方负责事务边界，也负责唤醒。** 本函数只 flush，不 commit——
+    `commit` 是一个跨越"数据库"与"消息队列"两个系统的决定（先落库再回调，
+    见 D4），把它藏在执行函数里会让那个顺序无处可见。
+
+    ## 为什么唤醒**不在**这里（M2 修正）
+
+    第一版在这里调 `wake`，紧跟在 `flush` 之后——而 flush 只让结果对
+    **本事务**可见。唤醒的接收方是 Gateway 进程，它用**自己的**会话去数
+    `case_results`：数不到，于是判定"还没到齐"，永远返回 pending。
+
+    也就是说"先落库再回调"里的"落库"，在跨进程的意义上只能是 `commit`。
+    这个错误在单元测试里看不出来——测试用的会话与写入者是同一个，
+    flush 之后它自己当然看得见（`tests/integration/test_runner.py` 里
+    第一版的那条断言就是这么写的，它测的是**同一会话可见性**，
+    而需求是**跨进程可见性**）。
+
+    所以唤醒归调用方：`exec_case` 在 `session.commit()` 之后调用它。
 
     Args:
         load_credential: 按 host 取凭证。做成回调而不是直接 import 仓储，
             是为了让凭证来源可替换（测试里返回一个固定的 `CredentialMaterial`
             就够了）。`None` 表示"这个 Run 没用凭证"。
-        wake: 唤醒回调。**在落库之后调用**——顺序不能反（见模块文档字符串）。
-            传 `None` 表示不回调，此时只能靠兜底轮询收尾
-            （那正是 M1 的专项检查 a 要验证的路径）。
 
     Returns:
-        执行结果。**调用方拿它做断言或日志**——返回值本身已经落库了。
+        执行结果。**调用方拿它做断言或日志**——返回值本身已经 flush 过。
 
     Raises:
         ValueError: 数据不完整（用例/接口/规格缺失，或 Spec 没有声明出站目标）。
@@ -385,11 +395,8 @@ def run_case(
         outcome.http_status,
     )
 
-    # ★ D4：**落库之后**才回调。反过来的话，编排层可能在结果写进去之前
-    # 就完成判定，看到"还没完成"而继续等待——直到兜底轮询才发现。
-    if wake is not None:
-        wake(run_id)
-
+    # ⚠️ **唤醒不在这里**（M2 修正，理由见 docstring）：这里只有 flush，
+    # 结果对别的进程还不可见，而唤醒的接收方正是别的进程。
     return outcome
 
 

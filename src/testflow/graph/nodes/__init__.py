@@ -2,8 +2,8 @@
 
 对应决策：`06-Agent编排.md` §3（节点表）、§4（主链与条件边）、G4/G5。
 
-    START → N1 → N2 → N3 → N4 → **IP-2** → N5 → N6 → N7 → END
-            解析   生成   决策   投递    等待     汇集  归因  报告
+    START → N1 → N2 → **IP-1** → N3 → N4 → **IP-2** → N5 → N6 → N7 → END
+            解析   生成    人工确认   决策   投递    等待     汇集  归因  报告
 
 ## 与计划里的文件布局有一处出入
 
@@ -39,9 +39,17 @@ from sqlalchemy.orm import Session
 
 from testflow.agents.spec_parser import SpecParseError, parse_spec
 from testflow.agents.test_case_gen import RuleBasedGenerator, generate_for_operations
+from testflow.domain.attribution import (
+    AttributionCategory,
+    AttributionDecision,
+    FailedCase,
+    FailureContext,
+    is_synthesized_stall,
+)
 from testflow.domain.graph import NodeFailure, RunPhase
 from testflow.graph.state import GraphState, failures_of
 from testflow.observability.logging import get_logger
+from testflow.storage.repositories import attributions as attributions_repo
 from testflow.storage.repositories import cases as cases_repo
 from testflow.storage.repositories import operations as operations_repo
 from testflow.storage.repositories import results as results_repo
@@ -49,12 +57,14 @@ from testflow.storage.repositories import runs as runs_repo
 from testflow.storage.repositories import specs as specs_repo
 
 __all__ = [
+    "analyze_failures",
     "apply_decisions",
     "build_report",
     "collect_results",
     "dispatch_cases",
     "generate_cases",
     "parse_spec_node",
+    "review_gate",
     "wait_for_results",
 ]
 
@@ -64,6 +74,7 @@ logger = get_logger(__name__)
 _NODE_LABELS: dict[str, str] = {
     "parse_spec": "解析 Spec",
     "generate_cases": "生成用例",
+    "review_gate": "人工确认",
     "apply_decisions": "落库决策",
     "dispatch_cases": "投递执行",
     "wait_for_results": "等待结果",
@@ -180,34 +191,59 @@ async def generate_cases(
 
     return {
         "case_ids": [str(cid) for cid in outcome.generated_case_ids],
-        "expected_case_count": len(outcome.generated_case_ids),
+        "generated_case_count": len(outcome.generated_case_ids),
         "node_failures": failures,
     }
+
+
+# ═══════════════════════════════════════════════ IP-1 人工确认
+
+
+async def review_gate(state: GraphState, *, session: Session) -> dict[str, Any]:
+    """IP-1：人工确认门。**整个函数体就是一次 `interrupt`。**
+
+    与 `wait_for_results`（IP-2）同理，必须是**独立节点**：被中断的节点在
+    恢复时会从头重跑，若把 `interrupt()` 塞进 N2 或 N3，恢复时会把生成或
+    决策逻辑再跑一遍——那会静默改写用户已确认的用例。
+
+    挂起期间用户在决策接口逐条批准 / 拒绝用例，那些决定写进
+    `cases.review_status`（PG 是权威）。本节点不读、也不决定任何东西——
+    它只负责把图**停在这里**，等一个"决策已提交"的唤醒信号。
+    """
+    from langgraph.types import interrupt
+
+    # 挂起前必须把 phase 写成 `awaiting_review`：兜底轮询与审阅超时扫描
+    # 看的正是这个状态（与 IP-2 写 `awaiting_results` 是同一个道理）。
+    runs_repo.set_phase(session, uuid.UUID(state["run_id"]), RunPhase.AWAITING_REVIEW)
+
+    interrupt(
+        {
+            "kind": "review",
+            "run_id": state["run_id"],
+            "expected": state.get("generated_case_count", 0),
+        }
+    )
+    return {"phase": RunPhase.DISPATCHING.value}
 
 
 # ═══════════════════════════════════════════════ N3 落库决策
 
 
 async def apply_decisions(state: GraphState, *, session: Session) -> dict[str, Any]:
-    """N3：确定"哪些用例允许执行"。
+    """N3：确定"哪些用例允许执行"。**只读人工决策，不在此处批准任何东西。**
 
-    ⚠️ **M1 没有人工确认门（IP-1）。** 这里无条件批准全部待审用例。
+    M2 起，批准 / 拒绝是 IP-1（`review_gate`）之后、由决策接口写进
+    `cases.review_status` 的事实（`06` §5.1）。本节点只**读**"已批准"的集合，
+    供下游路由判断。
 
-    这不是"加了一个可以打开的自动批准开关"——**是这个门此刻还不存在**。
-    路线图 Q1 警告过前者的风险：可关闭的安全开关会被误设、被复制到生产、
-    被"临时"关掉后遗忘。一个根本不存在的东西，没有"忘记关掉"的问题。
-
-    M2 会把 IP-1 插进图（N2 → IP-1 → N3），届时本函数的内容变成
-    "读已落库的人工决策"，**而下游一行都不用改**——路由依据一直是
-    `approved_case_ids` 是否为空，不是"有没有人审过"。
+    路由依据一直是 `approved_case_ids` 是否为空，不是"有没有人审过"——
+    所以把 M1 的"无条件批准"换成"读人工决策"之后，**下游一行都不用改**。
     """
     run_id = uuid.UUID(state["run_id"])
-    approved = cases_repo.approve_all_pending(session, run_id)
-
     approved_ids = [
         str(c.id) for c in cases_repo.list_by_run(session, run_id, review_status="approved")
     ]
-    logger.info("N3 批准 %d 条用例（M1 无 IP-1，全量批准）", approved)
+    logger.info("N3 读取人工决策：批准 %d 条用例", len(approved_ids))
     return {"approved_case_ids": approved_ids}
 
 
@@ -268,14 +304,26 @@ async def dispatch_cases(state: GraphState, *, session: Session, dispatch: Any) 
 
     # 一次投递 2000 条用例可能花几十秒。若不更新 `updated_at`，
     # 兜底轮询会把一个**正在正常工作**的 Run 判成停滞并强行推进。
-    runs_repo.touch(session, run_id)
-    # 投递完也要提交一次：`touch` 写的 `updated_at` 同样要在下一个进程
-    # （编排器的下一次唤醒）之前可见。
+    #
+    # ★ **派生缓存也在这里维护**（DM5：节点出口更新，供前端展示）。
+    # `expected` 的口径是"应当有结果的用例数"，所以它是 `count_dispatchable`
+    # 而不是 `len(approved)`——两者在破坏性用例上会分叉，而那些按 TE3
+    # 永远不会被执行，也就永远不会有结果。用 `len(approved)` 当分母，
+    # 完成判定就永远差那几条。
+    settled_now = results_repo.count_results(session, run_id)
+    runs_repo.set_case_counts(
+        session,
+        run_id,
+        expected=cases_repo.count_dispatchable(session, run_id),
+        settled=settled_now,
+    )
+    # 投递完也要提交一次：上面这几个写（`updated_at`、两个计数）同样要在
+    # 下一个进程（编排器的下一次唤醒）之前可见。
     session.commit()
     logger.info("N4 投递 %d 条用例（跳过 %d 条已有结果的）", dispatched, len(already_done))
     # 只返回 state 里存在的键——多出来的键会被 LangGraph 合并进状态，
     # 而一个不在 "契约" 里的字段会在 checkpoint 里越攒越多。
-    return {"settled_case_count": 0}
+    return {"settled_case_count": settled_now}
 
 
 # ═══════════════════════════════════════════════ IP-2 等待
@@ -311,7 +359,7 @@ async def wait_for_results(state: GraphState, *, session: Session) -> dict[str, 
         {
             "kind": "awaiting_results",
             "run_id": state["run_id"],
-            "expected": state.get("expected_case_count", 0),
+            "expected": state.get("generated_case_count", 0),
         }
     )
     return {"phase": RunPhase.ANALYZING.value}
@@ -338,7 +386,24 @@ async def collect_results(state: GraphState, *, session: Session) -> dict[str, A
     run_id = uuid.UUID(state["run_id"])
     runs_repo.set_phase(session, run_id, RunPhase.ANALYZING)
 
-    expected = state.get("expected_case_count", 0)
+    # ★ **分母是"应当有结果"的用例数，不是"生成了多少条"。**
+    #
+    # 第一版用的是 `state["expected_case_count"]`——那是 N2 生成的条数。
+    # 两者在有被拒绝或破坏性用例时会分叉，而分叉的后果很具体：
+    #
+    #     settled(2) < expected(3)  → 判定"结果不完整" → 记一条 partial_results，
+    #                                  并去补记缺失的那条为 timeout
+    #
+    # 于是每一次运行都会多出一条假的"部分失败"记录——**而 Run 的最终结论
+    # 仍然是 done、通过率仍然正确**，所以它看起来完全正常。
+    # 只有翻日志（或翻 `node_failures`）才会看到那句
+    # "N5 结果不完整：期望 3 条，已有 2 条"。
+    #
+    # 补记那一步在 M2 之前会真的写出一条假的 `timeout` 结果
+    # （把一个用户拒绝的用例说成"目标接口超时"）——那才是这个分母错误的
+    # 真正危害。它现在被 `mark_unfinished_as_timeout` 的过滤挡住了，
+    # 但分母本身仍然是错的，会继续制造假告警。
+    expected = cases_repo.count_dispatchable(session, run_id)
     settled = results_repo.count_results(session, run_id)
 
     failures = failures_of(state)
@@ -362,24 +427,140 @@ async def collect_results(state: GraphState, *, session: Session) -> dict[str, A
         ]
         settled = results_repo.count_results(session, run_id)
 
+    # 派生缓存（DM5）：这是"结果到齐"之后的最终值，前端与 CLI 读它。
+    # **判定仍然不读它**——`gateway/internal.py` 与下一次唤醒都查
+    # `case_results`，因为缓存会因为崩溃/重投而落后。
+    runs_repo.set_case_counts(session, run_id, settled=settled)
     return {"settled_case_count": settled, "node_failures": failures}
 
 
 # ═══════════════════════════════════════════════ N6 归因
 
 
-async def analyze_failures(state: GraphState, *, session: Session) -> dict[str, Any]:
-    """N6：对失败用例归因。**M1 是空操作。**
+def _rule_only_analyzer() -> Any:
+    """没有注入分析器时的兜底：只跑规则。
 
-    `LogAnalyzer`（规则 + LLM 兜底）属于 M3。这里保留节点而不删掉它，
-    是因为**图的结构是契约**——M3 只是填上函数体，而不是改拓扑。
+    这不是"半成品模式"，而是**保证每条失败都有归因**的最后一道防线。
+    生产环境由 `graph.tasks` 注入带 LLM 的 `LogAnalyzer`；图测试与离线运行
+    走这里，结论仍然确定（只是规则覆盖率会低，`unknown` 会多）。
 
-    删掉它、M3 再加回来，意味着中间这段时间里跑过的所有 Run 的
-    checkpoint 都对应一个"少一个节点"的图。而图结构变化会让旧 checkpoint
-    无法恢复——那正是 rolling upgrade 要处理的问题（`10` §8）。
+    为什么不直接不归因：失败用例在报告里没有归因，等于失败原因被悄悄吞掉。
+    `unknown` 至少是一个**可见的缺陷信号**（LA §3.4）。
     """
-    runs_repo.set_phase(session, uuid.UUID(state["run_id"]), RunPhase.ANALYZING)
-    return {"attribution_ids": []}
+    from testflow.agents.log_analyzer import LogAnalyzer
+
+    logger.warning("未注入归因分析器，N6 只跑规则（LLM 兜底不可用）")
+    return LogAnalyzer()
+
+
+async def analyze_failures(
+    state: GraphState, *, session: Session, analyzer: Any = None
+) -> dict[str, Any]:
+    """N6：对失败用例归因。
+
+    `LogAnalyzer`（规则 + LLM 兜底）由装配层注入（`graph/tasks.py`）。
+    节点本身**不 import 具体实现**——`graph/` 只依赖协议，这样"换一个分析器"
+    不需要改图（`02` §2.2 的分层理由）。
+
+    ## 两处容易写错的地方
+
+    1. **补记的超时不是失败**（`executor_stall`）。它们不参与归因、
+       也不该有归因行——否则报告里会出现一条"网络故障"，而事实是
+       我们根本没拿到结果（见 `is_synthesized_stall`）。
+    2. **重算要清理过期归因**。一条用例上次失败、这次通过，旧的归因行
+       必须删掉，否则报告会出现"失败 0 条、归因 3 条"。
+    """
+    run_id = uuid.UUID(state["run_id"])
+    runs_repo.set_phase(session, run_id, RunPhase.ANALYZING)
+
+    results = results_repo.list_by_run(session, run_id)
+    failing = [
+        row
+        for row in results
+        if row.status != "passed" and not is_synthesized_stall(row.status, row.error_kind)
+    ]
+
+    cases = cases_repo.list_by_run(session, run_id)
+    case_by_id = {case.id: case for case in cases}
+    failing_case_ids = {row.case_id for row in failing}
+    stale_case_ids = [case.id for case in cases if case.id not in failing_case_ids]
+    attributions_repo.delete_for_cases(session, run_id, stale_case_ids)
+
+    # 零失败：不构造 LLM 客户端、不写行（D10）。
+    if not failing:
+        return {"attribution_ids": []}
+
+    operation_ids = sorted(
+        {case_by_id[row.case_id].operation_id for row in failing if row.case_id in case_by_id}
+    )
+    operation_by_id = {op.id: op for op in operations_repo.list_by_ids(session, operation_ids)}
+
+    items: list[FailedCase] = []
+    for row in failing:
+        case = case_by_id.get(row.case_id)
+        if case is None:  # pragma: no cover —— 外键保证不会发生
+            continue
+        operation = operation_by_id.get(case.operation_id)
+        items.append(
+            FailedCase(
+                case_id=row.case_id,
+                context=FailureContext(
+                    status=row.status,
+                    http_status=row.http_status,
+                    error_kind=row.error_kind,
+                    response_body=row.response_body,
+                    truncated=row.response_body_truncated,
+                    assertion_outcomes=row.assertion_outcomes or (),
+                    case_confidence=case.confidence,
+                    responses_schema=operation.responses_schema if operation else None,
+                    elapsed_ms=row.elapsed_ms,
+                ),
+            )
+        )
+
+    outcome = await (analyzer or _rule_only_analyzer()).analyze(items)
+
+    rows: list[dict[str, Any]] = []
+    missing: list[uuid.UUID] = []
+    for item in items:
+        decision = outcome.decisions.get(item.case_id)
+        if decision is None:
+            missing.append(item.case_id)
+            decision = AttributionDecision(
+                category=AttributionCategory.UNKNOWN,
+                method="rule",
+                confidence="low",
+                evidence={"reason": "analysis_incomplete"},
+            )
+        rows.append(
+            {
+                "run_id": run_id,
+                "case_id": item.case_id,
+                "category": decision.category.value,
+                "method": decision.method,
+                "rule_ref": decision.rule_ref,
+                "llm_model": decision.llm_model,
+                "confidence": decision.confidence,
+                "evidence": decision.evidence,
+            }
+        )
+
+    attributions_repo.upsert_many(session, rows)
+
+    stored = {row.case_id: str(row.id) for row in attributions_repo.list_by_run(session, run_id)}
+    attribution_ids = [stored[item.case_id] for item in items if item.case_id in stored]
+
+    failures = [*failures_of(state), *outcome.failures]
+    if missing:
+        failures.append(
+            NodeFailure(
+                node="analyze_failures",
+                kind="attribution_incomplete",
+                detail=f"{len(missing)} 条失败用例没有拿到归因结论",
+                retryable=True,
+            )
+        )
+    return {"attribution_ids": attribution_ids, "node_failures": failures}
 
 
 # ═══════════════════════════════════════════════ N7 报告

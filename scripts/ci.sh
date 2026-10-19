@@ -80,11 +80,17 @@ fi
 
 # ─────────────────────────────────────────────────────────── ⑤ test
 STEP="⑤ test"
-step "⑤ test — 单元 + 集成"
+step "⑤ test — 单元 + 集成 + 对抗性"
 # 分层覆盖率（09 §2.3 TS2）：整体目标 ≥ 70%（PRD M6）。
 # 安全与判定类模块另有 ≥ 90% 的单独门槛，随对应模块落地加入：
 #   guardrail/policy（已就位）、execution/assertions、agents/rules
-uv run pytest tests/unit tests/integration \
+#
+# ★ M2 起把 `tests/security` 并入这一步。它**不是**重复劳动：那组测试
+# 断言的是"某一种绕过不可行"（`09` TS4/TS8），而不是"某个函数正确"。
+# 分两步跑会让"对抗性测试被单独跳过"变得可能，而它恰恰是最不该被跳过的那组
+# ——安全性质的失效在功能测试里看不出来。其中需要真实 PostgreSQL 的部分
+# 会按既有约定自动跳过，不影响无 Docker 的环境。
+uv run pytest tests/unit tests/integration tests/security \
   --cov=testflow \
   --cov-report=term-missing \
   --cov-report= \
@@ -116,12 +122,23 @@ ok "分层覆盖率达标"
 
 # ─────────────────────────────────────────────────────────── ⑥ build
 STEP="⑥ build"
-step "⑥ build — 镜像构建"
+step "⑥ build — 镜像构建（含前端）"
+# **前端编译正确性由这一步负责，不另开一步。** Dockerfile 是多阶段的，
+# node 阶段跑 `npm ci && npm run build`——而 `build` 的定义是
+# `vue-tsc --noEmit && vite build`，所以**类型检查与打包都在这条链上**。
+#
+# 为什么不把 npm 单独做成 ①–⑤ 里的一步（那会让 ci.sh 变成七步）：
+# 核心那五步是纯 Python 的，加一个需要 Node 的步骤会让"CI 能不能跑"
+# 取决于一个与后端无关的环境变量。而"六步"这个口径写在 `08` §6 里，
+# 改它要同步改文档——收益只是让日志多一行。
+#
+# 代价是**没有 Docker 时前端完全不被验证**（这一步会跳过）。
+# 那条跳过信息是明确的（⊘ 而不是 ✓），所以不会被误当成"验过了"。
 if [ -f Dockerfile ]; then
-  docker build -t testflow:ci . > /dev/null || fail "镜像构建"
-  ok "镜像构建成功"
+  docker build -t testflow:ci . > /dev/null || fail "镜像构建（含前端构建与类型检查）"
+  ok "镜像构建成功，前端已打包进 dist"
 else
-  skip "Dockerfile 尚未创建（M1）"
+  skip "Dockerfile 尚未创建（前端构建未验证）"
 fi
 
 printf "\n%s✓ CI 全部通过%s\n\n" "$GREEN" "$OFF"

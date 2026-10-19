@@ -21,7 +21,7 @@ import json
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from testflow.domain.graph import RunPhase
@@ -29,13 +29,24 @@ from testflow.gateway.auth import require_user_token
 from testflow.gateway.deps import GatewayContext
 from testflow.gateway.problems import ProblemDetail, problem_response
 from testflow.gateway.schemas import (
+    AttributionItem,
+    AttributionListResponse,
+    CaseListItem,
+    CaseListResponse,
     CreateRunRequest,
+    DecisionApplied,
+    DecisionRequest,
+    DecisionResponse,
+    HumanVerdictRequest,
     ReportResponse,
     RunCreatedResponse,
     RunStatusResponse,
 )
 from testflow.observability.logging import get_logger
+from testflow.storage.repositories import attributions as attributions_repo
+from testflow.storage.repositories import cases as cases_repo
 from testflow.storage.repositories import reports as reports_repo
+from testflow.storage.repositories import results as results_repo
 from testflow.storage.repositories import runs as runs_repo
 from testflow.storage.repositories import specs as specs_repo
 
@@ -49,6 +60,15 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 #: M1 的 SSE 是**短间隔轮询数据库**，不是真推送——见 `stream_events` 的说明。
 _POLL_INTERVAL_S = 1.0
 _HEARTBEAT_EVERY_TICKS = 15
+
+#: 用例列表的分页默认值与上限。
+#:
+#: 上限不是"性能调优"而是**契约**：一个 Run 最多 2000 条用例
+#: （`max_cases_per_run`），不设上限的话一次请求就能把它们全拉出来
+#: ——而确认界面一屏只显示几十条。上限让"一次拉全量"变成请求
+#: 方必须显式分页的事，而不是一个会随着数据增长悄悄变慢的默认行为。
+_DEFAULT_PAGE_SIZE = 50
+_MAX_PAGE_SIZE = 500
 
 
 @router.post(
@@ -138,6 +158,170 @@ async def get_run(run_id: str, request: Request) -> Any:
         )
     finally:
         session.close()
+
+
+@router.get(
+    "/{run_id}/cases",
+    response_model=CaseListResponse,
+    dependencies=[Depends(require_user_token)],
+    summary="列出该运行的用例（按置信度排序，分页）",
+    responses={
+        404: {"description": "Run 不存在（`problem+json`，`code=run_not_found`）"},
+    },
+)
+async def get_run_cases(
+    run_id: str,
+    request: Request,
+    limit: int = Query(default=_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0),
+) -> Any:
+    """用例列表。**排序是接口语义的一部分，不是实现细节**（`05` §4.3）。
+
+    低置信度在前——理由见 `cases_repo._CONFIDENCE_RANK`：那些用例的期望值
+    有一部分是推断出来的，正是"期望写错"这一类问题的所在。
+
+    ⚠️ **前端不该自己重排。** 排序放在服务端是刻意的：分页与排序必须由同一个
+    地方决定（否则"第 2 页"的含义取决于客户端按什么排的，而那个契约
+    没人写得下来）。PRD F9 也要求前端不重复实现业务规则。
+
+    `limit` 超上限由 FastAPI 直接拒绝（422，走统一的 problem+json 处理器）
+    ——而不是静默截断到上限：一个"我请求了 5000 条，拿到 500 条且没有提示"
+    的接口，会让调用方以为自己拿全了。
+    """
+    context: GatewayContext = request.app.state.ctx
+    session = context.session()
+    try:
+        run = _find_run(session, run_id)
+        if run is None:
+            return _not_found()
+
+        total = cases_repo.count_by_run(session, run.id)
+        rows = cases_repo.list_page(session, run.id, limit=limit, offset=offset)
+        return CaseListResponse(
+            run_id=str(run.id),
+            total=total,
+            limit=limit,
+            offset=offset,
+            items=[_to_case_item(row) for row in rows],
+        )
+    finally:
+        session.close()
+
+
+@router.post(
+    "/{run_id}/decisions",
+    response_model=DecisionResponse,
+    dependencies=[Depends(require_user_token)],
+    summary="提交人工确认决策（恢复 IP-1）",
+    responses={
+        404: {"description": "Run 不存在（`problem+json`，`code=run_not_found`）"},
+        409: {
+            "description": "Run 不在待确认状态，或已无待确认用例"
+            "（`problem+json`，`code=run_not_awaiting_review`）"
+        },
+        422: {
+            "description": "决策不完整——有未决用例未出现在请求中"
+            "（`problem+json`，`code=decision_incomplete`）"
+        },
+    },
+)
+async def submit_decisions(run_id: str, payload: DecisionRequest, request: Request) -> Any:
+    """提交批准 / 拒绝，然后把 Run 推离确认门（`05` §4.5）。
+
+    ## 决策先落库，再投递——顺序不能反（ADR-0009）
+
+    `advance()` **不带载荷**：图恢复时只收到"决策已提交"这个信号，
+    真正的决策从 PG 读（`apply_decisions` 查 `review_status == 'approved'`）。
+
+    若把决策放进 resume 载荷，就同时有了"载荷里的决策"和"PG 里的
+    `review_status`"两个事实来源——恢复时以谁为准又成了新问题，
+    而它的表现是"用户批了 40 条，结果跑了另外 40 条"。
+
+    所以 `commit()` **必须在**投递之前：投递只是叫醒推进者，
+    它醒来后读的是库。
+
+    ## 为什么 200、以及为什么第二次提交是 409
+
+    提交返回时 `review_status` 已经落库，用户的决定**已经生效**——
+    202 的"已受理、尚未处理"反而不准确。
+
+    第二次提交（两个标签页、双击）会命中 409：要么阶段已经离开
+    `awaiting_review`，要么待确认集合已经空了（决策已生效、正在恢复）。
+    两种情形的共同含义是"**这个 Run 现在不需要你确认了**"，
+    所以共用同一个错误码，而 `detail` 把具体情况说清楚。
+    """
+    context: GatewayContext = request.app.state.ctx
+    session = context.session()
+    try:
+        run = _find_run(session, run_id)
+        if run is None:
+            return _not_found()
+
+        if run.phase != RunPhase.AWAITING_REVIEW:
+            return _not_awaiting_review(f"当前阶段：{run.phase}")
+
+        pending = cases_repo.list_by_run(session, run.id, review_status="pending")
+        if not pending:
+            # 决策已经落库、只是推进者还没取走（resume 是异步的）。
+            # 这正是"双击提交"打中的窗口。
+            return _not_awaiting_review("该运行已无待确认的用例，决策正在生效")
+
+        requested = _parse_decisions(payload)
+        if requested is None:
+            return problem_response(
+                ProblemDetail(
+                    type="invalid_request",
+                    title="case_id 不是合法的 UUID",
+                    status=422,
+                    code="invalid_request",
+                )
+            )
+
+        pending_ids = {case.id for case in pending}
+        if set(requested) != pending_ids:
+            missing = len(pending_ids - set(requested))
+            unknown = len(set(requested) - pending_ids)
+            return problem_response(
+                ProblemDetail(
+                    type="decision_incomplete",
+                    title="决策不完整",
+                    status=422,
+                    code="decision_incomplete",
+                    detail=(
+                        f"该运行还有 {missing} 条待确认用例未出现在请求中，"
+                        f"另有 {unknown} 条不属于待确认集合。"
+                        "必须一次提交全部待确认用例的决策——"
+                        "没被提到的用例会停在 pending，既不执行也不出现在报告里。"
+                    ),
+                )
+            )
+
+        approve = [cid for cid, decision in requested.items() if decision == "approve"]
+        reject = [cid for cid, decision in requested.items() if decision == "reject"]
+        approved = cases_repo.set_review_status(session, approve, "approved")
+        rejected = cases_repo.set_review_status(session, reject, "rejected")
+        # ★ commit 必须在投递之前：推进者醒来时读的是库，不是这次请求的内存。
+        session.commit()
+        # 把 id 取成普通值再离开作用域——`session.close()` 之后 `run` 是游离对象，
+        # 读它的属性在 `expire_on_commit=False` 下恰好能用，但那依赖一个
+        # 别处的配置项。取出来就不依赖了。
+        run_uuid = run.id
+    finally:
+        session.close()
+
+    try:
+        context.require_producer().orchestrate(run_uuid, "decisions_submitted")
+    except Exception as exc:  # noqa: BLE001 —— 队列不可用是运行时状态，不是编程错误
+        # **决策已经生效，所以这不是失败。** 返回 503 会诱导用户重试，
+        # 而重试会命中 409——那时他会以为自己的决策丢了。
+        # 兜底轮询会在审阅超时前扫到它（`06` §6.4），所以这里只记日志。
+        logger.error("决策已落库但投递推进指令失败 run=%s：%s", run_uuid, exc)
+
+    logger.info("人工决策已提交 run=%s 批准=%d 拒绝=%d", run_uuid, approved, rejected)
+    return DecisionResponse(
+        run_id=str(run_uuid),
+        applied=DecisionApplied(approved=approved, rejected=rejected),
+    )
 
 
 @router.get(
@@ -269,6 +453,168 @@ async def stream_events(run_id: str, request: Request) -> Any:
     return StreamingResponse(_events(), media_type="text/event-stream")
 
 
+# ---------------------------------------------------------------- 归因（M3）
+
+
+@router.get(
+    "/{run_id}/attributions",
+    response_model=AttributionListResponse,
+    dependencies=[Depends(require_user_token)],
+    summary="列出失败归因（分页）",
+    responses={404: {"description": "运行不存在（`problem+json`，`code=run_not_found`）"}},
+)
+async def list_attributions(
+    run_id: str,
+    request: Request,
+    limit: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+) -> Any:
+    """列出某个 Run 的归因。分页约定与 `/cases` 一致。
+
+    **一次批量取用例与结果**，不逐条查——一页最多 500 条，
+    逐条查就是 1500 次往返（归因 + 用例 + 结果）。
+    """
+    context: GatewayContext = request.app.state.ctx
+    session = context.session()
+    try:
+        run = _find_run(session, run_id)
+        if run is None:
+            return _not_found()
+
+        rows = attributions_repo.list_page(session, run.id, limit=limit, offset=offset)
+        total = attributions_repo.count_by_run(session, run.id)
+        cases = {case.id: case for case in cases_repo.list_by_run(session, run.id)}
+        results = {row.case_id: row for row in results_repo.list_by_run(session, run.id)}
+        return AttributionListResponse(
+            run_id=str(run.id),
+            total=total,
+            limit=limit,
+            offset=offset,
+            items=[
+                _attribution_item(row, cases.get(row.case_id), results.get(row.case_id))
+                for row in rows
+            ],
+        )
+    finally:
+        session.close()
+
+
+@router.patch(
+    "/{run_id}/attributions/{attribution_id}",
+    response_model=AttributionItem,
+    dependencies=[Depends(require_user_token)],
+    summary="记录人工归因表态",
+    responses={
+        404: {"description": "运行或归因不存在（`problem+json`）"},
+        422: {"description": "表态与类别不匹配（`problem+json`）"},
+    },
+)
+async def submit_human_verdict(
+    run_id: str,
+    attribution_id: str,
+    payload: HumanVerdictRequest,
+    request: Request,
+) -> Any:
+    """记录 `agree` / `disagree`，以及（`disagree` 时**必须**给出的）正确类别。
+
+    ## 为什么 LA6 在路由里校验而不是 Pydantic 里
+
+    在 Pydantic 里加 `model_validator` 也能拦住，但它返回的是 FastAPI 默认
+    错误体（`{"detail": ...}`），而契约要求 `problem+json` 且 `code` 可区分
+    （`human_category_required` / `human_category_not_allowed`）。
+    调用方需要按 `code` 做分支，而不是解析中文句子。
+
+    ## 为什么返回 200 而不是 202
+
+    表态是同步且权威的：返回之前已经提交，人的判断**已经生效**。
+    """
+    if payload.verdict == "disagree" and payload.human_category is None:
+        return problem_response(
+            ProblemDetail(
+                type="human_category_required",
+                title="缺少正确类别",
+                status=422,
+                code="human_category_required",
+                detail="表态为 disagree 时必须给出你认为正确的类别——只记"
+                "「不同意」无法回答「该补哪条规则」（LA6）。",
+            )
+        )
+    if payload.verdict == "agree" and payload.human_category is not None:
+        return problem_response(
+            ProblemDetail(
+                type="human_category_not_allowed",
+                title="多余的类别",
+                status=422,
+                code="human_category_not_allowed",
+                detail="表态为 agree 时不应再给出另一个类别——那会让"
+                "「同意这个归因」与「我认为是另一类」两种含义混在一行里。",
+            )
+        )
+
+    context: GatewayContext = request.app.state.ctx
+    session = context.session()
+    try:
+        run = _find_run(session, run_id)
+        if run is None:
+            return _not_found()
+        try:
+            parsed_id = uuid.UUID(attribution_id)
+        except ValueError:
+            return _attribution_not_found()
+        row = attributions_repo.get_by_id(session, parsed_id)
+        # 归属别的 Run 的归因一律当作"不存在"——区分它们等于泄漏
+        # "这个 id 存在，只是不属于你"。
+        if row is None or row.run_id != run.id:
+            return _attribution_not_found()
+
+        updated = attributions_repo.set_human_verdict(
+            session,
+            parsed_id,
+            verdict=payload.verdict,
+            human_category=(
+                payload.human_category.value if payload.human_category is not None else None
+            ),
+        )
+        session.commit()
+        assert updated is not None  # 刚查到的行，不可能在这里消失
+
+        case = cases_repo.get(session, updated.case_id)
+        result = results_repo.get(session, updated.run_id, updated.case_id)
+        return _attribution_item(updated, case, result)
+    finally:
+        session.close()
+
+
+def _attribution_item(row: Any, case: Any, result: Any) -> AttributionItem:
+    return AttributionItem(
+        attribution_id=str(row.id),
+        case_id=str(row.case_id),
+        case_name=case.name if case else "(用例已删除)",
+        dimension=case.dimension if case else "",
+        status=result.status if result else "unknown",
+        http_status=result.http_status if result else None,
+        category=row.category,
+        method=row.method,
+        rule_ref=row.rule_ref,
+        llm_model=row.llm_model,
+        confidence=row.confidence,
+        evidence=row.evidence,
+        human_verdict=row.human_verdict,
+        human_category=row.human_category,
+    )
+
+
+def _attribution_not_found() -> JSONResponse:
+    return problem_response(
+        ProblemDetail(
+            type="attribution_not_found",
+            title="归因不存在",
+            status=404,
+            code="attribution_not_found",
+        )
+    )
+
+
 # ---------------------------------------------------------------- 助手
 
 
@@ -288,4 +634,71 @@ def _find_run(session, run_id: str):
 def _not_found() -> JSONResponse:
     return problem_response(
         ProblemDetail(type="run_not_found", title="运行不存在", status=404, code="run_not_found")
+    )
+
+
+def _not_awaiting_review(detail: str) -> JSONResponse:
+    """409。两种情形共用：**"这个 Run 现在不需要你确认了"**。
+
+    分两个错误码会让调用方多写一个分支，而他能做的事完全一样
+    （刷新状态、别再提交）。差异放在 `detail` 里给人看。
+    """
+    return problem_response(
+        ProblemDetail(
+            type="run_not_awaiting_review",
+            title="该运行不在待确认状态",
+            status=409,
+            code="run_not_awaiting_review",
+            detail=detail,
+        )
+    )
+
+
+def _parse_decisions(payload: DecisionRequest) -> dict[uuid.UUID, str] | None:
+    """把请求里的 case_id 转成 UUID。**有一个非法就整批拒绝**（返回 `None`）。
+
+    ## 为什么是"整批拒绝"而不是"跳过非法的"
+
+    跳过的话，那个 case_id 会落进"未出现在请求中"的差额里，于是错误信息说
+    "有 1 条待确认用例未提交"——而用户分明提交了它。他会去数自己的请求，
+    数出 118 条，然后完全不知道问题在哪。
+
+    返回 `None`（而不是抛异常）与 `GuardrailDenied` 同理：
+    **这是对输入的正常判断，不是平台故障。**
+
+    ## 为什么用 dict 而不是 list
+
+    同一个 case_id 出现两次时，dict 让"后写的生效"成为一个确定的行为
+    （而不是"两条都写库，`UPDATE ... WHERE id IN (...)` 一次命中两遍"）。
+    重复提交同一条决策是用户会做的事（两个标签页），
+    而它能有一个明确的语义好过有一个依赖实现细节的语义。
+    """
+    parsed: dict[uuid.UUID, str] = {}
+    for item in payload.decisions:
+        try:
+            parsed[uuid.UUID(item.case_id)] = item.decision
+        except ValueError:
+            return None
+    return parsed
+
+
+def _to_case_item(row: Any) -> CaseListItem:
+    """`Case` 行 → 接口模型。
+
+    显式逐字段构造，不用 `model_validate(row, from_attributes=True)`：
+    后者会把模型上**所有**字段都当候选，于是将来给 `cases` 表加一列
+    （例如凭证相关的东西）时，它会**自动出现在接口响应里**——
+    而"多暴露了一个字段"不会让任何测试失败。
+    """
+    return CaseListItem(
+        case_id=str(row.id),
+        name=row.name,
+        category=row.category,
+        dimension=row.dimension,
+        confidence=row.confidence,
+        review_status=row.review_status,
+        is_destructive=row.is_destructive,
+        request_method=row.request_method,
+        request_path=row.request_path,
+        assertions=row.assertions or [],
     )

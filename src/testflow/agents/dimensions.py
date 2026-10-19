@@ -34,7 +34,7 @@ from typing import Any
 
 from testflow.domain.cases import DimensionSpec
 
-__all__ = ["derive_dimensions", "is_pure_rule_operation"]
+__all__ = ["derive_dimensions", "is_pure_rule_operation", "json_body_schema"]
 
 #: `boundary` 维度展开成两条：边界值本身（应当被接受）与越界值（应当被拒绝）。
 #:
@@ -72,7 +72,7 @@ def is_pure_rule_operation(
     return not (has_params or has_body or has_client_errors)
 
 
-def _schema_of_request_body(request_body_schema: dict[str, Any] | None) -> dict[str, Any] | None:
+def json_body_schema(request_body_schema: dict[str, Any] | None) -> dict[str, Any] | None:
     """从 `requestBody` 里取出 JSON 媒体类型的 schema。
 
     只认 JSON——TestFlow 处理的是 JSON API。取不到时返回 `None`，
@@ -105,6 +105,21 @@ def _expected_status(responses_schema: dict[str, Any] | None, *codes: str) -> li
     return [int(code) for code in codes if str(code) in responses_schema]
 
 
+def declared_client_error_codes(responses_schema: dict[str, Any] | None) -> list[int]:
+    """`responses` 里**声明过**的 4xx 状态码，升序。
+
+    只认精确的三位数字键：`4XX` / `default` 是"任意 4xx/默认响应"，
+    不是某个具体状态码——把它们当成具体码会让生成的用例去断言一个
+    根本不存在的期望。
+    """
+    codes: list[int] = []
+    for key in responses_schema or {}:
+        text = str(key)
+        if len(text) == 3 and text.startswith("4") and text.isdigit():
+            codes.append(int(text))
+    return sorted(set(codes))
+
+
 def derive_dimensions(
     *,
     operation_path: str,
@@ -130,7 +145,7 @@ def derive_dimensions(
         )
     ]
 
-    body_schema = _schema_of_request_body(request_body_schema)
+    body_schema = json_body_schema(request_body_schema)
     if body_schema is not None:
         specs.extend(_dimensions_from_body_schema(body_schema, responses_schema))
 
@@ -143,6 +158,24 @@ def derive_dimensions(
                 category="abnormal",
                 expected_status=_expected_status(responses_schema, "404") or [404],
                 rationale="不存在的资源应当返回 404",
+            )
+        )
+
+    # ★ M4：Spec 声明的每个 4xx 都必须有对应用例。
+    #
+    # 不派生的话，L2 的"每个声明的 4xx 都被覆盖"只能靠模型自己发明维度——
+    # 而模型发明维度正是 L1 要拦的事（额外维度必须标 inferred 且有 50% 上限）。
+    # 让阶段 A 确定性地补上，L2 才是可达的，而不是一件碰运气的事。
+    covered = {code for spec in specs for code in spec.expected_status}
+    for code in declared_client_error_codes(responses_schema):
+        if code in covered:
+            continue
+        specs.append(
+            DimensionSpec(
+                dimension=f"status:{code}",
+                category="abnormal",
+                expected_status=[code],
+                rationale=f"Spec 声明了 {code}，必须有一条用例验证它",
             )
         )
 
@@ -192,19 +225,30 @@ def _dimensions_from_body_schema(
     return specs
 
 
+#: 会触发 `constraint_violation` 维度的约束键。
+#:
+#: `03/TestCaseGen.md` §2.3 的维度表把 `enum` / `pattern` / `format` /
+#: `multipleOf` 归在同一个维度名下：它们都是"值合法但违反某个约束"的形态。
+#: 第一版只认 `enum`——于是**带 `pattern` 的字段一个维度都派生不出来**，
+#: 而覆盖率仍然显示 100%，因为分母里根本没有它（§5.2 的自我参照陷阱）。
+#: M5 的 Golden Set 第 3 号接口就是为了让这个盲区暴露出来。
+_CONSTRAINT_KEYS: tuple[str, ...] = ("enum", "pattern", "format", "multipleOf")
+
+
 def _constraint_dimensions(
     field: str, field_schema: dict[str, Any], responses_schema: dict[str, Any] | None
 ) -> list[DimensionSpec]:
     specs: list[DimensionSpec] = []
 
-    if "enum" in field_schema:
+    present = [key for key in _CONSTRAINT_KEYS if key in field_schema]
+    if present:
         specs.append(
             DimensionSpec(
                 dimension=f"constraint_violation:{field}",
                 category="abnormal",
                 field=field,
                 expected_status=_expected_status(responses_schema, "400", "422") or [400],
-                rationale=f"{field} 取值不在 enum 内应当被拒绝",
+                rationale=f"{field} 违反 {' / '.join(present)} 约束应当被拒绝",
             )
         )
 

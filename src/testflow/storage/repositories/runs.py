@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime
 import uuid
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
@@ -28,7 +29,15 @@ from sqlalchemy.orm import Session
 from testflow.domain.graph import RunPhase
 from testflow.storage.models import Run
 
-__all__ = ["create", "get", "list_stalled", "set_phase", "touch"]
+__all__ = [
+    "create",
+    "delete_older_than",
+    "get",
+    "list_stalled",
+    "set_case_counts",
+    "set_phase",
+    "touch",
+]
 
 
 def create(session: Session, *, spec_id: uuid.UUID, spec_fingerprint: str) -> Run:
@@ -113,4 +122,105 @@ def list_stalled(
             .order_by(Run.updated_at)
             .limit(limit)
         )
+    )
+
+
+def delete_older_than(
+    session: Session,
+    *,
+    cutoff: datetime.datetime,
+    batch_size: int = 500,
+) -> int:
+    """删除 `created_at < cutoff` 的 Run，返回删除行数（`04` §5 / `10` §7）。
+
+    ## 为什么按批删而不是一条 DELETE
+
+    一条 `DELETE FROM runs WHERE created_at < ...` 会级联删除 cases /
+    results / attributions / reports / run_operations / llm_usage，
+    在大积压时生成一条极大的语句（WAL、内存、锁表）。按主键分批
+    （默认 500）把单条语句的规模限住。
+
+    ⚠️ **分批不等于分事务。** 本函数从头到尾在一笔事务里；锁要到调用方
+    commit 时才释放。清理任务在结束时 commit 一次。若将来积压大到影响
+    在线请求，正确做法是把"取一批 → commit"这一层上移到任务里循环调用，
+    而不是在这一层偷偷 commit（仓库层不该决定事务边界）。
+    **中断后重跑天然安全**：下一批还是从"最早且超期"的那条开始。
+
+    ## 级联由数据库负责
+
+    子表外键都是 `ON DELETE CASCADE`（`04` §2），应用侧不需要逐表删。
+    唯一例外是 `audit_logs.run_id`：它是 `ON DELETE SET NULL`——**审计记录
+    不该因为业务数据过期而消失**，只是失去 Run 关联（§5）。
+
+    ## 为什么返回行数
+
+    清理任务必须"记录每次删除的数量以便审计"（§5）。返回 0 也是信息：
+    它证明任务跑过、且没有可删的东西，而不是"任务没跑"。
+    """
+    total = 0
+    while True:
+        ids = list(
+            session.scalars(
+                select(Run.id)
+                .where(Run.created_at < cutoff)
+                .order_by(Run.created_at)
+                .limit(batch_size)
+            )
+        )
+        if not ids:
+            break
+
+        result = session.execute(
+            sa_delete(Run).where(Run.id.in_(ids)),
+            # ORM 不需要同步身份映射：这些行在清理任务里不会被再次读取。
+            execution_options={"synchronize_session": False},
+        )
+        session.flush()
+        # `Result.rowcount` 在 SQLAlchemy 的 CursorResult 上存在，但类型标注
+        # 挂在 `CursorResult` 上而不是泛化的 `Result`。getattr 比 cast 更直接：
+        # 这里要的就是"驱动报了几行"，拿不到时按 0 处理不会掩盖任何正常路径。
+        deleted = int(getattr(result, "rowcount", 0) or 0)
+        total += deleted
+
+        # 极端情况下（行刚被并发删掉）rowcount 可能为 0，但下一轮仍会
+        # 查到同一批 id。显式退出，避免无限循环。
+        if deleted == 0:
+            break
+    return total
+
+
+def set_case_counts(
+    session: Session,
+    run_id: uuid.UUID,
+    *,
+    expected: int | None = None,
+    settled: int | None = None,
+) -> None:
+    """更新两个**派生缓存**（DM5）。**仅供展示。**
+
+    `expected_case_count` 的口径是"**应当有结果**的用例数"，与
+    `cases_repo.count_dispatchable` 一致——不是"生成了多少条"。
+    用生成数当分母，一个被拒绝或破坏性的用例就会让 `settled` 永远追不上它。
+
+    ## ⚠️ 这不是任何正确性判断的依据
+
+    DM5 明确要求"完成判定一律 `SELECT count(*)` 查 `case_results`"，
+    这两个字段只服务 `GET /api/runs/{id}` 与 CLI 的展示。
+
+    第一版**没有任何地方写它们**，于是接口永远返回 `0/0`——
+    而网关里有一处完成判定**恰好读了它**（见 `gateway/internal.py`），
+    于是"缓存没人维护"和"有人拿缓存做判断"这两件事叠在一起，
+    把回调唤醒整条路径变成了空转。**两个各自看起来无害的决定，
+    合起来是一个功能性的失效**——这也是 DM5 为什么把话说到那个份上。
+
+    传 `None` 表示"这次不动这个字段"，所以调用方可以只更新其中一个。
+    """
+    values: dict[str, object] = {"updated_at": func.now()}
+    if expected is not None:
+        values["expected_case_count"] = expected
+    if settled is not None:
+        values["settled_case_count"] = settled
+    session.execute(
+        sa_update(Run).where(Run.id == run_id).values(**values),
+        execution_options={"synchronize_session": "fetch"},
     )

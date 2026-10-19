@@ -73,7 +73,7 @@
 | `value_valid` | 所有必填字段给合法值 | 2xx | 1 |
 | `required_missing:<field>` | `required` 中的每个字段 | 4xx | 每个必填字段 1 条 |
 | `type_mismatch:<field>` | 字段的 `type` | 4xx | 每个必填字段 1 条 |
-| `constraint_violation:<field>` | `enum` / `pattern` / `format` / `multipleOf` | 4xx | 每个约束 1 条 |
+| `constraint_violation:<field>` | `enum` / `pattern` / `format` / `multipleOf` | 4xx | 每个约束 1 条（同一字段多条约束合并为 1 条） |
 | `boundary:<field>` | `minimum` / `maximum` / `minLength` / `maxLength` / `minItems` / `maxItems` | 见下 | 每个边界 2 条 |
 | `not_found:<path_param>` | 路径参数（资源型） | 404 | 每个路径参数 1 条 |
 | `auth_missing` | `security` 声明存在时 | 401 / 403 | 1 |
@@ -262,6 +262,8 @@ class GenerationResult(BaseModel):
 > **⚠️ 已知局限：这个指标是自我参照的。** 分母由阶段 A 自己算出——若派生算法漏了 `maxLength` 这类约束，分母里就没有它，生成结果里也没有它，**覆盖率仍显示 100%**。任何自动检查都发现不了这件事，因为错的是分母。
 >
 > 因此 L2 覆盖率只能证明"派生出的维度都被覆盖了"，**不能证明"该派生的维度都派生了"**。后者的验证需要一个**人工标注的独立基准**（Golden Set），见 `09-测试策略.md` §5.2。这是 Golden Set 最重要的用途——它测的不是 LLM，而是**我们的派生算法有没有系统性盲区**。
+>
+> **M5 建立基准时抓到了三个盲区**：手工填写 Golden Set 的期望维度时，对照 §2.3 的维度表发现实现只认 `enum`——`pattern`、`format`、`multipleOf` 都没有派生维度，而覆盖率一直显示 100%。**没有测试变红**，是"人工清单里有、代码产不出来"这个对照暴露了它。修复后 `tests/unit/test_golden_set.py` 把这份人工基准钉进了 CI：今后任何派生算法的改动都会立刻和它比对。
 
 ### 5.3 重试策略
 
@@ -325,6 +327,16 @@ PRD R2 要求"缺 example 时标注低置信度用例，供人工重点复核"�
 
 **聚合规则**：一条用例只要含任一 `inferred` 断言或命中任一触发条件，则 `cases.confidence = 'low'`，否则 `'high'`。
 
+**实现状态（M5）**：可观测的五条已全部落地——`inferred` 断言/维度、
+响应体无 schema、自定义 `format`、`has_unresolved_ref`。第二、三条
+（无 example / 无边界约束）暂不触发：`value_valid` 不携带字段级信息，
+判断"合法值靠猜"需要阶段 B 的产物逐字段分析，当前没有可靠落点。
+
+自定义 `format` 的判定依据是一份**标准格式白名单**（`date-time`、`uuid`、
+`email` 等）。`imei` 这类业务格式仍会派 `constraint_violation` 维度——
+"应当拒绝不符合格式的值"是确定的——但具体什么值算不符合只能由模型猜，
+所以该用例标 `low`。这也是 Golden Set 第 10 号接口检验的降级行为。
+
 **落库**：`cases.confidence`（`04` §2.5）。前端在 IP-1 默认**按置信度排序**，让"低置信度"排在最前——人工确认的注意力应花在模型不确定的地方，而不是逐条看一遍。
 
 ---
@@ -352,6 +364,57 @@ PRD R2 要求"缺 example 时标注低置信度用例，供人工重点复核"�
 若一个 Operation 同时满足：**无请求参数、无请求体、`responses_schema` 中无 4xx 声明**——那么阶段 A 的维度清单只含 `value_valid` 一条，没有需要 LLM 发挥的余地。
 
 此时**不调用 LLM**，直接按规则生成一条用例。这是 `02` D3（"AI 只用在该用的地方"）在模块内部的延伸：不是所有 Operation 都值得一次 LLM 调用。
+
+### 8.5 M4 实测校准与落地口径
+
+**① 思考模式：设计稿的"生成开、归因关"被实测推翻。**
+
+基准脚本 `scripts/benchmark_llm.py`，同一批 fixture 接口：
+
+| 参数 | 首次通过率 | 输出 token | 单次 P95 | 成本 |
+| :--- | :--- | ---: | ---: | ---: |
+| `enable_thinking = true` | 67%（3 个接口） | 8,864 / 2 次 | ≈ 57s | ¥0.0077 |
+| `enable_thinking = false` | **100%**（5 接口 × 2 轮） | 4,350 / 10 次 | **≈ 8s** | ¥0.0053 / 10 次 |
+
+思考模式把单次调用推到 50 秒以上，超出 M4 验收线（P95 ≤ 30s），
+输出 token 是 7 倍，首次通过率还更低。`config.py` 的默认值因此改为
+**两条路径都关闭**——维度清单已经由阶段 A 确定性派生，模型只负责填取值，
+"想得久"不带来质量收益。
+
+**② 半稳定层内容（§6.1 的落地）**
+
+`agents/spec_context.py` 从 `Spec.raw_content` 提取，同一 Spec 内逐字节一致：
+
+- 根 `security` 需求（方案名 + scopes，排序）
+- `components.securitySchemes` 的 `type` / `in` / `scheme` / `bearerFormat`
+- `components.responses` 的名称与 content types
+
+**不含** `spec_id`、Run ID、时间戳、描述文本——它们会让每一次 Run 的
+前缀都不同，缓存命中率直接归零。
+
+**③ L1/L2 的落地口径（§5）**
+
+- L1：`cases` 非空；每个请求维度**恰好一条**；额外维度必须 `derived_from:
+  inferred` 且 `2 × 额外数 ≤ 请求数`；断言非空；`json_path` 用
+  `jsonpath_ng.ext` 做语法校验。
+- L2：每个请求维度被覆盖；`responses_schema` 中每个**精确三位 4xx**
+  至少一条用例的 `status_code` 断言期望它（`4XX` / `default` 不算）；
+  每条用例至少一条断言。
+- 反馈是**逐条列出**的修正提示（最多 8 条），追加在易变层末尾；稳定前缀
+  不变，所以重试不会让缓存失效。
+- 重试上限 2 次、指数退避 0.5s → 1.0s、**整体重发**（TG7）。
+
+**④ 阶段 A 新增 `status:<code>` 维度**
+
+Spec 声明的每个 4xx 若还没有维度覆盖，阶段 A 派生 `status:<code>`
+（`expected_status=[code]`）。没有它，L2 的"每个声明的 4xx 都被覆盖"
+只能靠模型自己发明维度——而模型发明维度正是 L1 要拦的事。
+
+**⑤ 用量采集**
+
+每次调用（含重试的每一次）写一行 `llm_usage`（`04` §2.9.1）：
+purpose / model / 各类 token / attempt / elapsed_ms。
+`run_id` 通过 ContextVar 传递——LLM 客户端是进程级的，构造时不知道任何 Run。
 
 ---
 
@@ -442,3 +505,4 @@ PRD R2 要求"缺 example 时标注低置信度用例，供人工重点复核"�
 | 版本 | 日期 | 变更内容 |
 | :--- | :--- | :--- |
 | v0.1 | 2026-10-13 | 初稿：维度确定/取值生成的核心主张、7 类维度、断言判别联合模型（解答 `04` Q1）、结构化输出契约、L1/L2 校验与重试、三层 Prompt 结构、低置信度标注、成本控制落点、Eval 集成、降级策略，沉淀 TG1~TG7 |
+| v0.2 | 2026-10-17 | **M4 实现回写（新增 §8.5）**：① 思考模式默认值由实测改为**生成也关闭**（P95 从 57s 降到 8s，首次通过率 67%→100%，输出 token 降至 1/7）；② 半稳定层落地为 Spec 级鉴权与通用响应结构，明确禁止 `spec_id`/时间戳；③ L1/L2 落成可执行规则（含 `jsonpath_ng` 语法校验、精确 4xx 覆盖、额外维度 ≤50%）；④ 反馈为逐条修正提示，只追加在易变层；⑤ 阶段 A 新增 `status:<code>` 维度，使 L2 的 4xx 覆盖可达；⑥ 每次调用写一行 `llm_usage`，`run_id` 经 ContextVar 归属 |

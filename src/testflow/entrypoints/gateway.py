@@ -21,10 +21,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
+from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import text
 
 from testflow import __version__
 from testflow.config import Settings, load_settings
@@ -32,12 +36,29 @@ from testflow.gateway.deps import GatewayContext, Producer
 from testflow.gateway.internal import router as internal_router
 from testflow.gateway.problems import ProblemDetail, problem_from_request, problem_response
 from testflow.gateway.routes import runs, specs
-from testflow.gateway.schemas import HealthResponse
+from testflow.gateway.schemas import HealthResponse, ReadinessCheck, ReadinessResponse
 from testflow.observability.logging import configure_logging, get_logger
 
-__all__ = ["create_app", "main"]
+__all__ = ["create_app", "main", "DEFAULT_FRONTEND_DIST"]
 
 logger = get_logger(__name__)
+
+#: 前端构建产物的默认位置。**相对进程的工作目录**。
+#:
+#: 这是一个刻意的取舍：包内相对路径在两种部署下都对不上——
+#: 装成 wheel 之后 `src/testflow/` 会落到 `site-packages/`，而 `frontend/dist`
+#: 在仓库根。所以工作目录成了契约的一部分，而它由两处保证：
+#: 本地开发从仓库根运行，容器里 `WORKDIR /app` 且 dist 被 COPY 到
+#: `/app/frontend/dist`。两处都不是隐含的假设。
+DEFAULT_FRONTEND_DIST = Path("frontend/dist")
+
+#: **绝不能被 SPA 兜底吞掉**的路径前缀。
+#:
+#: 少了这一条，`GET /api/runs/不存在的id` 会返回 `index.html` 与 200——
+#: 于是接口契约里"404 + problem+json"被一条 HTML 悄悄替换掉了，而
+#: 调用方（CLI、前端自己、将来的外部集成）拿到的是一个解析不了的响应。
+#: 更糟的是它**只在 dist 存在时**才发生，本地纯后端开发时一切正常。
+_API_PREFIXES = ("api/", "internal/")
 
 
 def create_app(
@@ -45,6 +66,7 @@ def create_app(
     *,
     context: GatewayContext | None = None,
     producer: Producer | None = None,
+    frontend_dist: Path | None = None,
 ) -> FastAPI:
     """构造 Gateway 应用。**不建任何连接。**
 
@@ -54,6 +76,8 @@ def create_app(
         context: 完整的上下文（测试用，可以塞一个假的 session 工厂）。
         producer: 编排队列的生产者。`None` 时 `POST /api/runs` 会返回 503——
             这是刻意的：**没有生产者时"已接受"是个谎言**。
+        frontend_dist: 前端构建产物目录。`None` 时用
+            `DEFAULT_FRONTEND_DIST`（相对工作目录）。
 
     Returns:
         装配好的 `FastAPI` 实例。它可以直接被 `openapi()` 调用导出契约。
@@ -92,8 +116,160 @@ def create_app(
         """
         return HealthResponse(status="ok")
 
+    @app.get(
+        "/readyz",
+        response_model=ReadinessResponse,
+        responses={503: {"model": ReadinessResponse, "description": "依赖不可达"}},
+        tags=["ops"],
+        summary="就绪检查",
+    )
+    async def readyz() -> JSONResponse:
+        """**会碰依赖**的就绪检查：PG 与 Redis 都能用才返回 200。
+
+        与 `/healthz` 的分工是刻意的（`10` §5）：
+
+        * `/healthz` 不碰任何依赖——否则数据库抖一下，编排器会把一个
+          **健康的 Gateway** 判死并重启，而重启解决不了数据库的问题
+        * `/readyz` 明确回答"现在能不能干活"，供人、负载均衡与部署脚本使用
+
+        依赖不可达时返回 **503 + problem 形状的 JSON**，而不是 200 加一个
+        布尔字段——后者会让所有只看状态码的调用方以为一切正常。
+
+        `detail` 只写**异常类型**。异常消息里可能有连接串、库名或路径，
+        而这个端点不需要认证（运维探针要能直接打）。
+        """
+        checks = list(
+            await asyncio.gather(
+                _check_database(ctx),
+                _check_redis(ctx.settings),
+            )
+        )
+        ready = all(check.ok for check in checks)
+        payload = ReadinessResponse(
+            status="ok" if ready else "degraded",
+            checks=checks,
+        )
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content=payload.model_dump(mode="json"),
+        )
+
+    # ★ 前端托管**必须注册在所有 API 路由之后**：路由是按注册顺序匹配的，
+    # 而下面那条兜底会接住"前面谁都没匹配上"的路径。
+    _install_frontend(app, frontend_dist or DEFAULT_FRONTEND_DIST)
+
     _install_error_handlers(app)
     return app
+
+
+#: 就绪检查的超时。**必须远小于任何调用方的超时**：探针要的是"现在能不能
+#: 干活"，而不是"等多久之后能不能"。2 秒足够本机/同网络的 PG 与 Redis 应答。
+_READY_TIMEOUT_S = 2.0
+
+
+async def _check_database(ctx: GatewayContext) -> ReadinessCheck:
+    """`SELECT 1`。用线程跑同步驱动，避免阻塞事件循环。"""
+
+    def _ping() -> None:
+        with ctx.engine.connect() as connection:
+            connection.execute(text("select 1"))
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_ping), timeout=_READY_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 —— 健康检查要把所有失败都变成"不健康"
+        return ReadinessCheck(name="database", ok=False, detail=type(exc).__name__)
+    return ReadinessCheck(name="database", ok=True)
+
+
+async def _check_redis(settings: Settings) -> ReadinessCheck:
+    """`PING` broker 所在的库。
+
+    只检查 broker 库而不检查 checkpoint 库：后者是图状态的缓存，丢了可以
+    从 PG 重跑（ADR-0009）；前者不通则整个系统无法投递任务，那才是"不就绪"。
+    """
+    from redis.asyncio import Redis
+
+    client = Redis.from_url(
+        f"{settings.redis_url.rstrip('/')}/{settings.redis_broker_db}",
+        socket_connect_timeout=_READY_TIMEOUT_S,
+        socket_timeout=_READY_TIMEOUT_S,
+    )
+    try:
+        await client.ping()
+    except Exception as exc:  # noqa: BLE001
+        return ReadinessCheck(name="redis", ok=False, detail=type(exc).__name__)
+    finally:
+        # 关闭本身失败不该把一个"已经判定为不健康"的检查变成 500。
+        with contextlib.suppress(Exception):
+            await client.aclose()
+    return ReadinessCheck(name="redis", ok=True)
+
+
+def _install_frontend(app: FastAPI, dist: Path) -> None:
+    """托管前端构建产物 + SPA 兜底路由。
+
+    ## 为什么不用 `app.mount("/", StaticFiles(directory=dist, html=True))`
+
+    它两件事都做不了：
+
+    1. **`html=True` 的 404 行为**只覆盖"目录里没有这个文件"，而 SPA 需要
+       `/runs/01J.../confirm` 这种**磁盘上根本不存在**的路径也返回
+       `index.html`（那是前端路由，不是文件）
+    2. 更糟的是它会**吞掉 API 的 404**：挂载在 `/` 上意味着任何没匹配上的
+       路径都交给它，包括 `/api/runs/不存在的id`——于是契约里那条
+       "404 + problem+json" 变成了一份 HTML。
+
+    所以这里手写兜底：先看是不是真文件，再看是不是 API 路径，最后才
+    回退到 `index.html`。
+
+    ## dist 不存在时**不跳过注册，而是返回 404**
+
+    两种做法都能让本地纯后端开发正常工作。选后者是因为它让**路由集合与
+    工作目录无关**：CI 第 ④ 步导出契约快照时不依赖任何文件的存在，
+    而"开发机上有 dist、CI 上没有"造成的差异会以
+    "契约在本地和 CI 不一致"这种最难查的形式出现。
+    """
+
+    index_file = dist / "index.html"
+
+    # `response_model=None`：这个端点返回 `FileResponse` 或 `JSONResponse`，
+    # 而 FastAPI 不接受它们的联合作为响应模型（同 `GET /report`）。
+    # 它是兜底路由、不进契约（`include_in_schema=False`），
+    # 所以这里没有"契约会因此缺一块"的问题。
+    @app.get("/{full_path:path}", include_in_schema=False, response_model=None)
+    async def _spa(full_path: str) -> FileResponse | JSONResponse:
+        if full_path.startswith(_API_PREFIXES):
+            # 前面所有 API 路由都没匹配上 —— 那就是真的不存在。
+            # 走统一的 problem+json，与没有前端时**逐字节一致**。
+            return problem_response(
+                ProblemDetail(
+                    type="not_found",
+                    title="路径不存在",
+                    status=404,
+                    code="not_found",
+                )
+            )
+
+        if not index_file.is_file():
+            # 没有前端产物（纯后端部署 / CI）。明确说清，而不是返回一个
+            # 空白的 200——那会让人以为前端坏了。
+            return problem_response(
+                ProblemDetail(
+                    type="frontend_not_built",
+                    title="前端尚未构建",
+                    status=404,
+                    code="frontend_not_built",
+                    detail=f"未找到 {index_file}。请先运行 `npm ci && npm run build`。",
+                )
+            )
+
+        # 真文件（`/assets/index-abc123.js` 这类）直接给；
+        # 其余（`/upload`、`/runs/xxx/confirm`）交给前端路由，
+        # 所以返回 `index.html` 让浏览器端的路由接手。
+        candidate = (dist / full_path).resolve()
+        if full_path and candidate.is_file() and candidate.is_relative_to(dist.resolve()):
+            return FileResponse(candidate)
+        return FileResponse(index_file)
 
 
 def _install_error_handlers(app: FastAPI) -> None:

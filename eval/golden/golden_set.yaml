@@ -1,0 +1,256 @@
+openapi: 3.0.3
+info:
+  title: TestFlow Golden Set
+  version: "1.0.0"
+  description: |
+    L3 评测的固定输入。**10 个接口，每个只承载一种会让维度派生算法出错的
+    特征**（`docs/09-测试策略.md` §5.3）。
+
+    这份文档**不是**"随便挑十个接口"：接口 5（字符串长度）与 9（纯规则路径）
+    是刻意选的边界——前者是派生算法最容易漏的一类，后者用来证明 TG5 真的
+    没有调用 LLM。
+
+    每一行 `paths` 的语义由 `golden_set.annotations.yaml` 中的人工标注定义。
+    改这份文档必须同步改标注，否则 `tests/unit/test_golden_set.py` 会失败。
+servers:
+  - url: http://golden.testflow.local
+
+paths:
+  # ── 1. 仅路径参数，无请求体 ──────────────────────────────────────────
+  /items/{item_id}:
+    get:
+      operationId: get_item
+      summary: 仅路径参数
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 资源存在
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+
+  # ── 2. 多个必填 + 可选参数 ───────────────────────────────────────────
+  /users:
+    post:
+      operationId: create_user
+      summary: 必填与可选字段
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email]
+              properties:
+                name:
+                  type: string
+                email:
+                  type: string
+                nickname:
+                  type: string
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+        "400":
+          description: 请求不合法
+
+  # ── 3. enum 与 pattern ───────────────────────────────────────────────
+  /accounts:
+    post:
+      operationId: create_account
+      summary: 枚举与正则约束
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role:
+                  type: string
+                  enum: [admin, user]
+                code:
+                  type: string
+                  pattern: "^[A-Z]{3}$"
+      responses:
+        "201":
+          description: 创建成功
+        "422":
+          description: 约束不满足
+
+  # ── 4. 数值 minimum / maximum（附 multipleOf）────────────────────────
+  /products:
+    post:
+      operationId: create_product
+      summary: 数值边界与整除约束
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                price:
+                  type: number
+                  minimum: 0
+                  maximum: 10000
+                quantity:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  multipleOf: 5
+      responses:
+        "201":
+          description: 创建成功
+        "400":
+          description: 数值越界
+
+  # ── 5. 字符串 minLength / maxLength（最容易漏的一类）─────────────────
+  /profiles:
+    post:
+      operationId: create_profile
+      summary: 字符串长度边界
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bio:
+                  type: string
+                  minLength: 1
+                  maxLength: 280
+      responses:
+        "201":
+          description: 创建成功
+        "400":
+          description: 长度越界
+
+  # ── 6. 嵌套对象 + $ref 复用 ──────────────────────────────────────────
+  /orders:
+    post:
+      operationId: create_order
+      summary: 嵌套对象与引用复用
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [billing, shipping]
+              properties:
+                billing:
+                  $ref: "#/components/schemas/Address"
+                shipping:
+                  $ref: "#/components/schemas/Address"
+      responses:
+        "201":
+          description: 创建成功
+        "400":
+          description: 地址不完整
+
+  # ── 7. 声明多个 4xx ──────────────────────────────────────────────────
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      summary: 多个错误状态码
+      parameters:
+        - name: invoice_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 发票详情
+        "400":
+          description: 参数不合法
+        "401":
+          description: 未认证
+        "404":
+          description: 不存在
+        "409":
+          description: 状态冲突
+
+  # ── 8. 响应无 schema ─────────────────────────────────────────────────
+  /reports/summary:
+    get:
+      operationId: report_summary
+      summary: 响应没有结构
+      parameters:
+        - name: dimension
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [day, week]
+      responses:
+        "200":
+          description: 一段不可解析的文本摘要（刻意不声明 schema）
+
+  # ── 9. 无参数、无请求体、无 4xx 声明（TG5 纯规则路径）────────────────
+  /health:
+    get:
+      operationId: health
+      summary: 纯规则路径
+      responses:
+        "200":
+          description: 健康
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+
+  # ── 10. 自定义 format ────────────────────────────────────────────────
+  /devices:
+    post:
+      operationId: create_device
+      summary: 未知语义的 format
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                serial:
+                  type: string
+                  format: imei
+                model:
+                  type: string
+      responses:
+        "201":
+          description: 创建成功
+
+components:
+  schemas:
+    Address:
+      type: object
+      required: [street, city]
+      properties:
+        street:
+          type: string
+        city:
+          type: string

@@ -9,9 +9,13 @@
 
 **{{ rate }}**
 
-分母只含**已执行**的用例（`passed + failed + timeout + error`）。
-未执行、被跳过的用例不参与计算——否则"我们没跑的"会稀释通过率，
+分母只含**已执行且拿到测试结论**的用例（`passed + failed + timeout + error`）。
+未执行、被跳过、被拒绝的用例不参与计算——否则"我们没跑的"会稀释通过率，
 把一个真实的失败率说小。
+
+**"未完成"也不参与计算**：那是平台补记的超时（结果没回来），
+不是"目标服务没按时回应"。把它算进分母，等于把一次平台侧的丢失
+说成被测服务的性能问题。
 
 | 状态 | 条数 |
 | :--- | ---: |
@@ -20,31 +24,99 @@
 | 失败 | {{ content.summary.failed }} |
 | 超时 | {{ content.summary.timeout }} |
 | 错误 | {{ content.summary.error }} |
+| **未完成（平台补记）** | {{ content.summary.unfinished }} |
 | **未执行** | {{ content.summary.skipped }} |
 | 用例总数 | {{ content.summary.total_cases }} |
+
+## 质量与成本
+
+{% set usage = content.llm_usage %}
+| 指标 | 值 |
+| :--- | :--- |
+| 规则覆盖率 | {% if content.rule_coverage is not none %}{{ "%.0f%%" | format(content.rule_coverage * 100) }}{% else %}不适用（无失败用例）{% endif %} |
+| LLM 调用 | {{ usage.calls }} 次（生成 {{ usage.generation_calls }} / 归因 {{ usage.attribution_calls }}） |
+| 输入 token | {{ usage.prompt_tokens }} |
+| 输出 token | {{ usage.completion_tokens }} |
+| 缓存命中 token | {{ usage.cached_tokens }} |
+| 缓存命中率 | {% if usage.cache_hit_rate is not none %}{{ "%.0f%%" | format(usage.cache_hit_rate * 100) }}{% else %}—{% endif %} |
+| **本次成本** | {% if usage.cost_cny is not none %}¥{{ "%.4f" | format(usage.cost_cny) }}{% elif usage.unpriced_models %}未配置单价（{{ usage.unpriced_models | join("、") }}）{% else %}—{% endif %} |
+| 单次调用 P95 | {% if usage.p95_latency_ms is not none %}{{ usage.p95_latency_ms }} ms{% else %}—{% endif %} |
+| 生成采纳率 | {% if usage.generation_acceptance_rate is not none %}{{ "%.0f%%" | format(usage.generation_acceptance_rate * 100) }}{% else %}—{% endif %} |
+
+{% if usage.usage_missing_calls %}
+> ⚠️ 有 {{ usage.usage_missing_calls }} 次调用没有返回 token 用量，**本次成本被低估**。
+{% endif %}
+
+> 缓存命中率**长期为 0 是缺陷，不是波动**（`07` §5.3）：前缀失效不会报错，
+> 只会让账单变贵。规则覆盖率长期偏低时，正确的反应是**补规则**，而不是
+> 依赖模型——后者的成本随失败数线性增长，且结论从确定性滑向概率性。
+
+## 失败归因（按责任归属）
+
+{% if content.attribution_groups %}
+| 责任归属 | 条数 |
+| :--- | ---: |
+{% for group, count in content.attribution_groups.items() -%}
+| {{ group }} | {{ count }} |
+{% endfor %}
+{% else %}
+没有失败的用例，因此没有归因。
+{% endif %}
+
+> 零值的组也会列出——"环境侧 0 条"本身就是一条信息：不用去查网络。
 
 ## 失败清单
 
 {% if content.failures %}
-| 用例 | 维度 | 状态 | HTTP | 期望 | 实际 |
-| :--- | :--- | :--- | ---: | :--- | :--- |
+| 用例 | 维度 | 状态 | HTTP | 归因 | 置信度 | 期望 | 实际 | 备注 |
+| :--- | :--- | :--- | ---: | :--- | :--- | :--- | :--- | :--- |
 {% for item in content.failures -%}
-| {{ item.case_name }} | `{{ item.dimension }}` | {{ item.status }} | {{ item.http_status or "—" }} | {{ item.expected or "—" }} | {{ item.actual or "—" }} |
+| {{ item.case_name }} | `{{ item.dimension }}` | {{ item.status }} | {{ item.http_status or "—" }} | {{ item.category or "—" }} | {{ item.confidence or "—" }} | {{ item.expected or "—" }} | {{ item.actual or "—" }} | {{ item.hint or "" }} |
 {% endfor %}
 {% else %}
 没有失败的用例。
 {% endif %}
 
-## 未执行的用例
+## 未执行的破坏性用例
 
-{% if content.skipped %}
-以下用例**没有执行**，因此它们的通过与否是未知的：
+{% set destructive = content.skipped | selectattr("reason", "equalto", "destructive_not_authorized") | list %}
+{% if destructive %}
+以下用例是**破坏性接口**，按设计不自动执行，也还没有授权入口（TE3）。
+它们的通过与否是未知的——报告不能因此看起来"全绿"：
+
+| 用例 |
+| :--- |
+{% for item in destructive -%}
+| {{ item.case_name }} |
+{% endfor %}
+{% else %}
+没有未执行的破坏性用例。
+{% endif %}
+
+## 未完成的用例
+
+{% if content.unfinished_cases %}
+以下用例**没有拿到执行结果**（回调丢失 / Worker 被强杀 / 超时链路失效）。
+它们的失败原因是**未知**的，不要照着这一节去排查目标服务：
 
 | 用例 | 原因 |
 | :--- | :--- |
-{% for item in content.skipped -%}
+{% for item in content.unfinished_cases -%}
 | {{ item.case_name }} | `{{ item.reason }}` |
 {% endfor %}
 {% else %}
-全部用例都已执行。
+全部用例都拿到了结果。
+{% endif %}
+
+## 未执行的用例
+
+{% set other = content.skipped | rejectattr("reason", "equalto", "destructive_not_authorized") | list %}
+{% if other %}
+| 用例 | 原因 |
+| :--- | :--- |
+{% for item in other -%}
+| {{ item.case_name }} | `{{ item.reason }}` |
+{% endfor %}
+{% else %}
+没有其他未执行的用例。
 {% endif %}

@@ -28,6 +28,7 @@ Gateway 重启、网络抖动、`internal_token` 配错、Worker 被强杀在回
 
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 from celery import shared_task
@@ -37,8 +38,9 @@ from testflow.domain.graph import RunPhase
 from testflow.graph.tasks import _get_context, orchestrate
 from testflow.observability.logging import get_logger
 from testflow.storage.repositories import runs as runs_repo
+from testflow.storage.repositories import specs as specs_repo
 
-__all__ = ["fallback_poll"]
+__all__ = ["abandon_stale_reviews", "cleanup_expired_data", "fallback_poll"]
 
 logger = get_logger(__name__)
 
@@ -80,3 +82,93 @@ def fallback_poll() -> dict[str, Any]:
         logger.warning("兜底轮询发现 %d 个停滞的 Run（回调链路可能有问题）", len(stalled))
 
     return {"scanned": len(stalled), "enqueued": len(stalled)}
+
+
+@shared_task(name="testflow.abandon_stale_reviews", queue=ORCHESTRATE_QUEUE, max_retries=0)
+def abandon_stale_reviews() -> dict[str, Any]:
+    """把挂起超过 `review_timeout_days` 的 Run 标为 `abandoned`。
+
+    对应 `06` §5.1：IP-1 不能永远等人。一个 Run 停在 `awaiting_review` 太久
+    （默认 7 天），说明用户已经放弃它了——留着会让"审阅超时扫描"以外的
+    任何东西（前端列表、报告汇总）都看到一个永不结束的 Run。
+
+    与 `fallback_poll` 的区别：那个是**推进**（把卡住的 Run 救回来），
+    这个是**放弃**（把没人管的 Run 了结）。放弃是终态，所以这里**直接写**
+    `set_phase(ABANDONED)`，不需要投递到编排器——没有下一步可走。
+    """
+    context = _get_context()
+    settings = context.settings
+
+    session = context.sessions()
+    try:
+        stalled = runs_repo.list_stalled(
+            session,
+            phase=RunPhase.AWAITING_REVIEW,
+            stale_after_s=settings.review_timeout_days * 86400,
+        )
+        for run in stalled:
+            runs_repo.set_phase(
+                session, run.id, RunPhase.ABANDONED, failure_reason="review_timeout"
+            )
+        session.commit()
+    finally:
+        session.close()
+
+    if stalled:
+        logger.warning("审阅超时，abandon %d 个 Run", len(stalled))
+
+    return {"abandoned": len(stalled)}
+
+
+@shared_task(name="testflow.cleanup_expired_data", queue=ORCHESTRATE_QUEUE, max_retries=0)
+def cleanup_expired_data() -> dict[str, Any]:
+    """删除超过 `run_retention_days` 的 Run，以及因此变成孤儿的 Spec。
+
+    对应 `04-数据模型.md` §5、`10-部署运维.md` §7。
+
+    ## 顺序：先 Run，后 Spec
+
+    一个 Spec 只有在**引用它的最后一个 Run 也被删掉之后**才是孤儿。
+    反过来做的话，一个刚过期 Run 的 Spec 会多活一整个周期。
+
+    ## 幂等与可重入
+
+    两个操作都是"按时间条件删除"，重复执行第二次只会删到 0 条。
+    中断后重跑也一样：条件没有状态，不依赖"上次删到哪"。
+
+    ## 刻意不删 `audit_logs`
+
+    `04` §5 说审计日志同样保留 90 天。这里**没有实现**那条删除，是 M5 的
+    一个显式决定：审计记录是"发生过什么"的唯一凭证，批量删除它的能力
+    应当有一个独立的人工授权入口，而不是藏在一个每日定时任务里。
+    Run 删除本身会把 `audit_logs.run_id` 置 NULL（外键 `SET NULL`），
+    记录仍然保留。这个偏差已回写到 `04` §5。
+
+    ## 返回删除数量
+
+    "记录每次删除的数量以便审计"（§5）。零也是信息：它证明任务跑过，
+    而不是调度停了。
+    """
+    context = _get_context()
+    settings = context.settings
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        days=settings.run_retention_days
+    )
+
+    session = context.sessions()
+    try:
+        runs_deleted = runs_repo.delete_older_than(session, cutoff=cutoff)
+        # 同一个事务里判断孤儿：此时刚删掉的 Run 已经对 `NOT EXISTS` 不可见，
+        # 于是它们的 Spec 立即有资格被清理，不必等到明天。
+        specs_deleted = specs_repo.delete_orphans_older_than(session, cutoff=cutoff)
+        session.commit()
+    finally:
+        session.close()
+
+    logger.info(
+        "数据清理完成：删除 Run %d 个、孤儿 Spec %d 个（保留期 %d 天）",
+        runs_deleted,
+        specs_deleted,
+        settings.run_retention_days,
+    )
+    return {"runs_deleted": runs_deleted, "specs_deleted": specs_deleted}

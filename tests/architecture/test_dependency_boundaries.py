@@ -108,6 +108,22 @@ RULES: tuple[Rule, ...] = (
 CLIENT_MODULE = "testflow.client"
 CLIENT_IMPORTERS_ALLOWED = frozenset({"testflow.entrypoints.cli", "testflow.entrypoints.worker"})
 
+#: CLI 能引用的包内模块（PRD F9）。
+#:
+#: F9 要求 CLI **不重复实现业务逻辑**：它只把 HTTP 请求发出去、把响应读回来。
+#: 而这条约束有一个很自然的破坏方式——"顺手 import 一下 `SpecParser`
+#: 在本地先看看文档合不合法"。那看起来是个贴心的优化，实际制造了
+#: **第二份解释器**：CLI 跑在用户的机器上，于是"这份文档会被怎么理解"
+#: 有了两个实现，而两者不一致的部分表现为"CLI 说没问题，平台说解析失败"。
+#:
+#: **`testflow` 本身必须是精确匹配**（不能写成前缀）：一旦写成前缀，
+#: 它会把 `testflow.storage`、`testflow.graph` 等等全部放进来——
+#: 而那条规则的值恰好在于那些前缀是**被排除**的。CLI 需要它的唯一理由
+#: 是 `from testflow import __version__`。
+CLI_MODULE = "testflow.entrypoints.cli"
+CLI_ALLOWED_EXACT = frozenset({"testflow"})
+CLI_ALLOWED_PREFIXES = ("testflow.client", "testflow.domain")
+
 
 # --------------------------------------------------------------- 检查实现
 
@@ -202,6 +218,34 @@ def find_client_violations(module: str, source: str) -> list[Violation]:
     return found
 
 
+def find_cli_violations(module: str, source: str) -> list[Violation]:
+    """检查 CLI 只引用 `testflow.client` / `testflow.domain`（PRD F9）。"""
+    if module != CLI_MODULE:
+        return []
+    found: list[Violation] = []
+    for line, name in imported_modules(source):
+        if not name.startswith(PACKAGE_NAME):
+            continue
+        if name in CLI_ALLOWED_EXACT:
+            continue
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in CLI_ALLOWED_PREFIXES):
+            continue
+        found.append(
+            Violation(
+                module,
+                line,
+                name,
+                "CLI 只能引用 client/ 与 domain/",
+                "CLI 是 Gateway 的**纯 HTTP 客户端**（PRD F9）。引用 graph/、"
+                "execution/、storage/ 会让它获得「在本地把业务逻辑再实现一遍」的"
+                "能力——而那正是 F9 要防的：同一个问题（这份文档怎么解释）"
+                "一旦有两个实现，不一致的部分就表现为"
+                "「CLI 说没问题，平台说解析失败」。",
+            )
+        )
+    return found
+
+
 # ------------------------------------------------------------------ 测试
 
 
@@ -212,6 +256,7 @@ def test_all_modules_respect_dependency_boundaries() -> None:
         source = path.read_text(encoding="utf-8")
         violations.extend(find_rule_violations(module, source))
         violations.extend(find_client_violations(module, source))
+        violations.extend(find_cli_violations(module, source))
 
     assert not violations, (
         f"发现 {len(violations)} 处架构违规：\n\n"
@@ -297,3 +342,46 @@ def test_checker_allows_cli_importing_client() -> None:
     assert not find_client_violations(
         "testflow.entrypoints.cli", "from testflow.client import api\n"
     )
+
+
+class TestCliImportWhitelist:
+    """PRD F9：CLI 不重复实现业务逻辑（EN2 / ADR-0005 的同类约束）。"""
+
+    def test_the_real_cli_stays_within_the_whitelist(self) -> None:
+        """对**真实文件**跑一遍——上面那条全量扫描也会覆盖它，
+        但单独一条能让失败信息直指"CLI 越界了"而不是淹没在全量报告里。"""
+        source = (PACKAGE_ROOT / "entrypoints" / "cli.py").read_text(encoding="utf-8")
+        assert not find_cli_violations(CLI_MODULE, source)
+
+    @pytest.mark.parametrize(
+        ("source", "should_flag"),
+        [
+            # 白名单内：
+            ("from testflow.client import api\n", False),
+            ("from testflow.client.api import GatewayApiClient\n", False),
+            ("from testflow.domain.graph import RunPhase\n", False),
+            ("from testflow import __version__\n", False),
+            # 越界：
+            ("from testflow.storage.repositories import runs\n", True),
+            ("from testflow.graph import runner\n", True),
+            ("from testflow.agents.spec_parser import parse_spec\n", True),
+            ("from testflow.execution.runner import run_case\n", True),
+            ("import testflow.config\n", True),
+            # 连**别的入口点**也不行：`from testflow.entrypoints.gateway import
+            # create_app` 会把整个服务端应用拖进一个只想发 HTTP 请求的进程。
+            ("from testflow.entrypoints.gateway import create_app\n", True),
+        ],
+    )
+    def test_the_checker_flags_what_it_should(self, source: str, should_flag: bool) -> None:
+        violations = find_cli_violations(CLI_MODULE, source)
+        assert bool(violations) is should_flag, f"对 {source!r} 的判定与预期不符"
+
+    def test_the_bare_package_match_is_exact_not_a_prefix(self) -> None:
+        """★ 这条守的是**检查器自己**的一个陷阱。
+
+        `testflow` 若按前缀匹配，`testflow.storage` 之类会全部通过——
+        而这条规则的**全部价值**就在于那些前缀是被排除的。
+        一个"看起来在检查、实际什么都放行"的检查器，比没有检查器更糟。
+        """
+        assert not find_cli_violations(CLI_MODULE, "from testflow import __version__\n")
+        assert find_cli_violations(CLI_MODULE, "from testflow.storage import models\n")

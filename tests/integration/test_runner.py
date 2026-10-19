@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from testflow.execution.runner import load_case_spec, run_case
 from testflow.guardrail.pipeline import EgressPolicy
@@ -323,38 +323,149 @@ class TestIdempotency:
         assert results_repo.get(session, run.id, loose.id).status == "failed"
 
 
-class TestWakeCallback:
-    def test_wake_is_called_after_the_result_is_persisted(self, wired) -> None:
-        """**D4：先落库，再回调。顺序不能反。**
+class TestWakeOrdering:
+    """**D4：先落库，再回调。顺序不能反——而"落库"指的是 `commit`。**
 
-        若先回调再落库，编排层可能在结果写进去之前就完成判定，
-        看到"还没完成"而继续等待——直到兜底轮询才发现。
-        反过来（落库成功但回调丢了）只是晚一点推进，而兜底轮询会收尾。
-        **两种失败模式的代价完全不同。**
+    ## 这批测试取代了一条**验错了东西**的测试
 
-        这里断言回调触发**那一刻**结果是否已经可见。
+    第一版在 `run_case` 上断言"回调触发时结果已经可查"，用的却是**同一个
+    会话**：`session.flush()` 之后读一次，当然读得到。而唤醒的接收方是
+    **另一个进程**（Gateway），它用自己的会话去数 `case_results`——
+    flush 过的东西它根本看不见。
+
+    也就是说那条测试验的是**同一会话可见性**（任何 write 都满足），
+    而真正的需求是**跨进程可见性**（只有 commit 满足）。
+    它绿着，而功能是坏的——这正是"测试替换掉了被测的那一环"。
+
+    新的一批把 `exec_case` 整个跑起来，并在回调里断言
+    **事务已经结束**：那是"提交过了"的可观测证据。
+    """
+
+    def test_the_wake_fires_only_after_the_transaction_is_committed(
+        self,
+        session: Session,
+        make_settings,
+        make_spec,
+        make_operation,
+        make_run,
+        make_case,
+        monkeypatch,
+    ) -> None:
+        """★ 核心断言：回调触发时 `session.in_transaction()` 必须是 `False`。
+
+        `in_transaction()` 是一个**精确**的信号：`commit()` 之后会话处于
+        无事务状态，直到下一条语句才重新开始。所以"回调时没有活动事务"
+        等价于"这个会话刚刚提交过"——而这正是跨进程可见的前提。
+
+        用 flush 时它是 `True`（事务还开着），于是这条断言会在第一版的
+        实现上直接变红。
         """
-        make, run, client, policy, settings, session = wired
-        case = make("/ok", [{"type": "status_code", "expected": 200, "derived_from": "spec"}])
+        from testflow.execution import tasks as exec_tasks
 
-        observed: list[bool] = []
+        spec = make_spec(declared_targets=["http://127.0.0.1:9000"])
+        op = make_operation(spec)
+        run = make_run(spec)
+        case = make_case(run, op)
 
-        def _wake(_run_id: uuid.UUID) -> None:
-            # 回调里查一次库——这正是编排层醒来之后会做的事（`06` §6.2）。
-            session.flush()
-            observed.append(results_repo.get(session, run.id, case.id) is not None)
-
-        run_case(
-            session,
-            run_id=run.id,
-            case_id=case.id,
-            client=client,
-            policy=policy,
-            settings=settings,
-            wake=_wake,
+        connection = session.get_bind()
+        factory = sessionmaker(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        guardrail = GuardrailSyncClient(
+            make_settings(guardrail_allow_private_targets=["127.0.0.1:9000"])
         )
 
-        assert observed == [True], "回调触发时结果必须已经可查——否则编排层会判定失败"
+        observed: list[dict[str, object]] = []
+        task_session_holder: dict[str, Session] = {}
+
+        def _make_session() -> Session:
+            s = factory()
+            task_session_holder["session"] = s
+            return s
+
+        context = exec_tasks._WorkerContext(
+            settings=make_settings(guardrail_allow_private_targets=["127.0.0.1:9000"]),
+            engine=connection.engine,  # type: ignore[attr-defined]
+            sessions=_make_session,  # type: ignore[arg-type]
+            guardrail=guardrail,
+        )
+        monkeypatch.setattr(exec_tasks, "_context", context)
+        monkeypatch.setattr(
+            exec_tasks,
+            "_wake",
+            lambda _run_id: observed.append(
+                {"in_transaction": task_session_holder["session"].in_transaction()}
+            ),
+        )
+
+        try:
+            exec_tasks.exec_case(str(run.id), str(case.id))
+        finally:
+            guardrail.close()
+
+        assert observed == [{"in_transaction": False}], (
+            "唤醒触发时任务的事务还开着——结果对别的进程不可见，"
+            "于是 Gateway 数不到它，判定「还没到齐」而永远返回 pending"
+        )
+        assert results_repo.get(session, run.id, case.id) is not None, "结果仍然要落库"
+
+    def test_the_wake_is_not_part_of_the_transaction(
+        self,
+        session: Session,
+        make_settings,
+        make_spec,
+        make_operation,
+        make_run,
+        make_case,
+        monkeypatch,
+    ) -> None:
+        """唤醒回调抛异常**不能**让一个已经成功的用例变成失败任务。
+
+        结果是权威的（已经在库里了），而唤醒只是一次通知——
+        投递失败由兜底轮询补上（`06` §6.4）。把它放进 `try` 里的话，
+        一次 Gateway 抖动会连带把用例标成失败，而它其实跑得好好的。
+        """
+        from testflow.execution import tasks as exec_tasks
+
+        spec = make_spec(declared_targets=["http://127.0.0.1:9000"])
+        op = make_operation(spec)
+        run = make_run(spec)
+        case = make_case(run, op)
+
+        connection = session.get_bind()
+        factory = sessionmaker(
+            bind=connection,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        )
+        settings = make_settings(guardrail_allow_private_targets=["127.0.0.1:9000"])
+        guardrail = GuardrailSyncClient(settings)
+        context = exec_tasks._WorkerContext(
+            settings=settings,
+            engine=connection.engine,  # type: ignore[attr-defined]
+            sessions=factory,
+            guardrail=guardrail,
+        )
+        monkeypatch.setattr(exec_tasks, "_context", context)
+
+        def _boom(_run_id: object) -> None:
+            raise RuntimeError("Gateway 不可达")
+
+        # ⚠️ 替换的是**注入进来的那个回调**（`_wake_callback`），而不是
+        # `_wake` 本身——后者是**被测的那一层**（它的 fail-soft 就是本文
+        # 要验的东西）。替换 `_wake` 会让这条测试绕开自己的断言对象，
+        # 然后以一个和真实情况无关的方式失败。
+        monkeypatch.setattr(exec_tasks, "_wake_callback", _boom)
+
+        try:
+            result = exec_tasks.exec_case(str(run.id), str(case.id))
+        finally:
+            guardrail.close()
+
+        assert result["status"] == "passed", "唤醒失败不该改变用例的结论"
+        assert results_repo.get(session, run.id, case.id) is not None
 
     def test_no_wake_callback_still_produces_a_result(self, wired) -> None:
         """回调丢失时结果照常落库。

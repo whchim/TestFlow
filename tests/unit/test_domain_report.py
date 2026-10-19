@@ -69,6 +69,15 @@ class TestPassRateDenominator:
         s = _summary(passed=5, failed=5, executed=10, total_cases=1000)
         assert pass_rate(s) == 0.5
 
+    def test_unfinished_cases_do_not_dilute_the_rate(self) -> None:
+        """补记的"未完成"不是测试结论，不能进分母（RA3 的 M3 细化）。
+
+        若它进了分母，一次"平台丢了 8 条结果、其余 1 过 1 败"的运行会显示成
+        10%，而真实通过率是 50%——报告把平台故障说成了被测服务大面积失败。
+        """
+        s = _summary(passed=1, failed=1, executed=2, unfinished=8, total_cases=10)
+        assert pass_rate(s) == 0.5
+
 
 class TestPassRateZeroDenominator:
     def test_returns_none_not_zero(self) -> None:

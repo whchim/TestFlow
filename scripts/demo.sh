@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 #
-# M1 的端到端验收：**一份 Spec 进去，一份报告出来**（11-开发路线图.md M1）。
+# 端到端验收：**一份 Spec 进去，一份报告出来**（11-开发路线图.md M4）。
 #
 #   docker compose up -d
 #   ./scripts/demo.sh
 #
-# 全程走真实链路：Gateway 收文档 → 编排器跑图 → Worker 打 fixture → 出报告。
-# 没有任何一步是打桩的。
+# 全程走真实链路：Gateway 收文档 → 编排器跑图 → **人工确认门** → Worker 打
+# fixture → 归因 → 出报告。没有任何一步是打桩的。
+#
+# M2 起链路里多了一道人工确认门（IP-1）。本脚本在第 5 步自动批准全部待确认
+# 用例——**演示脚本的职责是把链路跑通，不是替人做决定**；真实使用时应打开
+# 确认界面逐条看。
 #
 # ## 为什么 demo 不需要 LLM API Key
 #
@@ -134,13 +138,14 @@ RUN_RESPONSE=$(api POST /api/runs --data "{\"spec_id\": \"$SPEC_ID\"}")
 RUN_ID=$(json_get "d['run_id']" <<< "$RUN_RESPONSE")
 ok "run_id=$RUN_ID（已投递到 orchestrate 队列）"
 
-# ───────────────────────────────────────────────── 5. 等待完成
+# ───────────────────────────────────────────────── 5. 等待完成（含 IP-1）
 
 step "5. 等待执行完成"
-info "（M1 没有人工确认门：用例生成后自动全批准——见 11 §7 Q1）"
+info "途中会经过人工确认门（IP-1）：脚本自动批准全部待确认用例"
 
 deadline=$(( SECONDS + TIMEOUT_SECONDS ))
 last_phase=""
+reviewed=0
 while [ $SECONDS -lt $deadline ]; do
   body=$(api GET "/api/runs/$RUN_ID")
   phase=$(json_get "d['phase']" <<< "$body")
@@ -148,6 +153,24 @@ while [ $SECONDS -lt $deadline ]; do
     info "phase: $last_phase → $phase"
     last_phase="$phase"
   fi
+
+  # ★ IP-1：卡在确认门上时提交决策。**必须一次覆盖全部待确认用例**——
+  # 少提一条，那条会永远停在 pending：既不执行，也不出现在报告里。
+  if [ "$phase" = "awaiting_review" ] && [ "$reviewed" -eq 0 ]; then
+    CASES=$(api GET "/api/runs/$RUN_ID/cases?limit=500")
+    DECISIONS=$(python -c "
+import json,sys
+payload = json.load(sys.stdin)
+print(json.dumps({'decisions': [
+    {'case_id': item['case_id'], 'decision': 'approve'}
+    for item in payload['items']
+]}))
+" <<< "$CASES")
+    APPLIED=$(api POST "/api/runs/$RUN_ID/decisions" --data "$DECISIONS")
+    ok "已批准 $(json_get "d['applied']['approved']" <<< "$APPLIED") 条待确认用例"
+    reviewed=1
+  fi
+
   case "$phase" in
     done) break ;;
     failed|abandoned) fail "Run $phase：$(json_get "d.get('failure_reason')" <<< "$body")" ;;
@@ -193,9 +216,66 @@ if not (0.0 < rate < 1.0):
     raise SystemExit(1)
 
 print("    ✓ 通过率非空，且不是 100%（fixture 里本来就有一半端点会失败）")
+
+# ── M3 归因
+groups = payload["content"].get("attribution_groups") or {}
+coverage = payload["content"].get("rule_coverage")
+
+if not groups:
+    print("    ✗ 报告里没有任何责任归属分组——归因没有落库")
+    raise SystemExit(1)
+
+if coverage is None:
+    print("    ✗ 规则覆盖率是 null——分母为 0，说明失败用例没有被统计到")
+    raise SystemExit(1)
+
+if not (0.0 < coverage <= 1.0):
+    print(f"    ✗ 规则覆盖率越界：{coverage}")
+    raise SystemExit(1)
+
+nonzero = {k: v for k, v in groups.items() if v}
+print(f"    ✓ 规则覆盖率 = {coverage:.0%}，归因分组：{nonzero}")
+print(f"    ✓ LLM 兜底 {payload['content'].get('llm_calls', 0)} 条")
+
+# ── M4 质量与成本
+usage = payload["content"].get("llm_usage") or {}
+calls = usage.get("calls", 0)
+cost = usage.get("cost_cny")
+cached = usage.get("cached_tokens", 0)
+p95 = usage.get("p95_latency_ms")
+
+if calls == 0:
+    print("    ✗ 没有任何 LLM 调用记录——用量采集没有接上")
+    raise SystemExit(1)
+
+if cost is None:
+    print(f"    ✗ 成本未知（模型：{usage.get('unpriced_models')}），请补单价表")
+    raise SystemExit(1)
+
+if cost > 2.0:
+    print(f"    ✗ 单 Run 成本 ￥{cost:.4f} 超过验收线 ￥2")
+    raise SystemExit(1)
+
+if cached == 0:
+    # 验收要求 > 0。为 0 时先查前缀是否逐字节稳定，不当作波动（07 §5.3）。
+    print("    ✗ 缓存命中 token 为 0——前缀可能被破坏，或缓存尚未生效")
+    raise SystemExit(1)
+
+if p95 is not None and p95 > 30_000:
+    print(f"    ✗ 单次调用 P95 {p95}ms 超过验收线 30s")
+    raise SystemExit(1)
+
+print(
+    f"    ✓ LLM 调用 {calls} 次（生成 {usage.get('generation_calls', 0)} / "
+    f"归因 {usage.get('attribution_calls', 0)}），成本 ￥{cost:.4f}"
+)
+print(
+    f"    ✓ 缓存命中 {cached} token（{usage.get('cache_hit_rate') or 0:.0%}），"
+    f"P95 {p95 or '—'}ms，采纳率 {usage.get('generation_acceptance_rate') or 0:.0%}"
+)
 PY
 
-printf "\n%s✓ M1 端到端链路跑通%s\n\n" "$GREEN" "$OFF"
+printf "\n%s✓ M4 端到端链路跑通（含人工确认、归因与成本核算）%s\n\n" "$GREEN" "$OFF"
 info "报告快照（Markdown）：GET $GATEWAY/api/runs/$RUN_ID/report"
 info "运行状态：            GET $GATEWAY/api/runs/$RUN_ID"
 info "事件流：              GET $GATEWAY/api/runs/$RUN_ID/events"

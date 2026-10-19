@@ -11,14 +11,18 @@
 所以加了这个入口点。代价是一个文件；收益是配置注入的规则没有例外。
 （入口点本身被排除在覆盖率要求之外，见 `08` §2.3。）
 
-## 定时任务只有一个
+## 定时任务
 
 | 任务 | 间隔 | 作用 |
 | :--- | :--- | :--- |
 | `testflow.fallback_poll` | 1 分钟 | 找回因回调丢失而悬空的 Run |
+| `testflow.abandon_stale_reviews` | 每小时 | 了结审阅超时的 Run（IP-1） |
+| `testflow.cleanup_expired_data` | 每日 | 删除超期 Run 与孤儿 Spec（`04` §5） |
 
-M5 还会加清理与备份两项（`10` §7），但 M1 只需要这一个——
-**它是"丢了回调图仍能推进"那条验收的唯一保障。**
+三个任务都必须**幂等且可重入**（`10` §7）：它们可能因进程重启而被重复
+触发，重复执行不应产生副作用。备份不走 beat——`pg_dump` 需要 PostgreSQL
+客户端工具，而 Worker 镜像里没有；它由 `scripts/pg_backup.sh` 在宿主机上
+按 cron 执行（`10` OP3）。
 """
 
 from __future__ import annotations
@@ -45,7 +49,20 @@ def build_beat_app(settings=None):
             "task": "testflow.fallback_poll",
             "schedule": crontab(minute="*"),  # 每分钟
             "options": {"queue": ORCHESTRATE_QUEUE},
-        }
+        },
+        "abandon-stale-reviews": {
+            "task": "testflow.abandon_stale_reviews",
+            # 审阅超时以天计（默认 7 天），每小时查一次足够，且不撞整点。
+            "schedule": crontab(minute=17),
+            "options": {"queue": ORCHESTRATE_QUEUE},
+        },
+        "cleanup-expired-data": {
+            "task": "testflow.cleanup_expired_data",
+            # 每天一次，凌晨低峰。用 37 分而不是整点：整点是所有"每天跑一次"
+            # 的任务的默认选择，而它们会在同一分钟互相争抢数据库连接。
+            "schedule": crontab(hour=3, minute=37),
+            "options": {"queue": ORCHESTRATE_QUEUE},
+        },
     }
     return app
 

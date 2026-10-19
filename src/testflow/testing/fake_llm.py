@@ -29,6 +29,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from testflow.domain.attribution import (
+    AttributionCategory,
+    Confidence,
+    FallbackAttribution,
+)
 from testflow.domain.cases import DimensionSpec, GeneratedCase, GenerationResult
 from testflow.llm.client import LLMError, ModelT
 from testflow.observability.logging import get_logger
@@ -43,27 +48,50 @@ class FakeLLMProvider:
 
     model_name = "fake-llm-0"
 
-    def __init__(self, *, fail_for: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        *,
+        fail_for: frozenset[str] = frozenset(),
+        fail_attribution: bool = False,
+        attribution_category: AttributionCategory = AttributionCategory.ASSERTION_MISMATCH,
+        attribution_confidence: Confidence = "high",
+    ) -> None:
         """
         Args:
-            fail_for: 对这些 `operation.path` 抛出 `LLMError`——
-                用来验证"部分失败不阻塞全局"（一个接口的生成失败，
-                不该让整份 Spec 的生成全部作废）。
+            fail_for: 对这些接口抛出 `LLMError`——用来验证"部分失败不阻塞全局"
+                （一个接口的生成失败，不该让整份 Spec 的生成全部作废）。
+
+                ⚠️ 取值是提示词里那一行的**完整内容**，形如 `"POST /echo"`，
+                不是裸的 `"/echo"`。因为解析出来的就是这一整行
+                （见 `_extract_operation_path`），而方法名是接口身份的一部分：
+                `GET /echo` 与 `POST /echo` 是两个不同的 Operation。
+            fail_attribution: 归因调用一律抛 `LLMError`，用于验证
+                "单条归因失败不阻塞整个 N6"。
+            attribution_category / attribution_confidence: 归因兜底的确定性输出。
+                默认给 `assertion_mismatch` + `high`——**故意从最高档开始**，
+                这样"LA3 封顶是否生效"在测试里是可见的（输出会变成 medium/low）。
         """
         self._fail_for = fail_for
+        self._fail_attribution = fail_attribution
+        self._attribution_category = attribution_category
+        self._attribution_confidence = attribution_confidence
         self.calls: list[str] = []
+        self.attribution_calls: list[str] = []
 
     async def generate(self, *, prompt: str, schema: type[ModelT]) -> ModelT:
         """按 Schema 生成确定性的输出。
 
-        **只支持 `GenerationResult`。** 其他 Schema 直接报错——
-        一个"什么都返回点东西"的假 Provider 会让"Schema 用错了"这类 bug
-        在离线测试里消失，而它只在真实调用时才暴露。
+        **只支持 `GenerationResult` 与 `FallbackAttribution`。** 其他 Schema
+        直接报错——一个"什么都返回点东西"的假 Provider 会让"Schema 用错了"
+        这类 bug 在离线测试里消失，而它只在真实调用时才暴露。
         """
+        if schema is FallbackAttribution:
+            return self._generate_attribution(prompt)  # type: ignore[return-value]
+
         if schema is not GenerationResult:
             raise LLMError(
-                f"假 Provider 只实现了 GenerationResult，收到 {schema.__name__}。"
-                "若新增了别的结构化输出场景，请显式扩展这里——"
+                f"假 Provider 只实现了 GenerationResult 与 FallbackAttribution，"
+                f"收到 {schema.__name__}。若新增了别的结构化输出场景，请显式扩展这里——"
                 "静默返回一个空对象会让那个场景在离线测试里永远通过。"
             )
 
@@ -83,6 +111,32 @@ class FakeLLMProvider:
         return schema.model_validate(
             GenerationResult(cases=cases, operation_notes="由假 Provider 确定性生成")
         )
+
+    def _generate_attribution(self, prompt: str) -> FallbackAttribution:
+        """确定性的归因输出。
+
+        读 `HTTP_STATUS:` / `CASE_CONFIDENCE:` 两个标记行——与生成路径同理，
+        **用模板里写死的标记，不靠正则猜**。解析失败就报错：一个"随便返回
+        点东西"的假归因会让"提示词字段漏了"这类 bug 在离线测试里消失。
+        """
+        http_status = _extract_marker(prompt, "HTTP_STATUS: ")
+        case_confidence = _extract_marker(prompt, "CASE_CONFIDENCE: ")
+        self.attribution_calls.append(http_status)
+        if self._fail_attribution:
+            raise LLMError("（假 Provider 按要求让归因失败）")
+        return FallbackAttribution(
+            category=self._attribution_category,
+            confidence=self._attribution_confidence,
+            evidence=[f"HTTP status {http_status}"],
+            reasoning=f"假 Provider 的确定性归因（用例置信度 {case_confidence}）",
+        )
+
+
+def _extract_marker(prompt: str, marker: str) -> str:
+    for line in prompt.splitlines():
+        if line.startswith(marker):
+            return line[len(marker) :].strip()
+    raise LLMError(f"提示词里缺少 `{marker.strip()}` 标记行——见 agents/prompts.py")
 
 
 def _extract_operation_path(prompt: str) -> str:
@@ -121,8 +175,17 @@ def _case_for(*, op_path: str, spec: DimensionSpec) -> GeneratedCase:
     取值的规则是**平凡但合法**的：`value_valid` 传空、其他维度不产出
     （由上面的 `raise` 保证）。这样"假 Provider 产出的用例能跑通整条链路"
     这件事是真的——它产出的东西是合法输入，不是占位符。
+
+    M4 起额外支持两类**只靠状态码**的维度：`status:<code>`（阶段 A 为声明的
+    4xx 派生）与 `not_found`。它们的期望值直接来自 `expected_status`，
+    假 Provider 造出来不是"看起来像"，而是真的正确——所以不违反上面那条原则。
+    边界/约束类维度仍然拒绝：那些需要理解字段约束，假造一条等于没测。
     """
-    if spec.dimension != "value_valid":
+    if not (
+        spec.dimension == "value_valid"
+        or spec.dimension == "not_found"
+        or spec.dimension.startswith("status:")
+    ):
         raise LLMError(
             f"假 Provider 不支持维度 {spec.dimension!r}。"
             "阶段 A 派生出的复杂维度需要真实模型——"
@@ -132,8 +195,8 @@ def _case_for(*, op_path: str, spec: DimensionSpec) -> GeneratedCase:
     expected = spec.expected_status[0] if spec.expected_status else 200
     return GeneratedCase(
         dimension=spec.dimension,
-        name=f"{op_path} 正常请求（假 Provider）",
-        category="normal",
+        name=f"{op_path} {spec.dimension}（假 Provider）",
+        category=spec.category,
         assertions=[
             {"type": "status_code", "expected": expected, "derived_from": "spec"}  # type: ignore[list-item]
         ],

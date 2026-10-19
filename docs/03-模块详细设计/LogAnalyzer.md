@@ -117,7 +117,7 @@ PRD 场景 S3 定义的诉求是：**知道"是参数问题还是服务问题"**
 
 1. 它**必然**走 LLM 兜底路径（或其他需要判断的类别）
 2. 归因时**必须参考用例的 `confidence`**（`04` §2.5）——见 §6
-3. 输出为 `assertion_mismatch` 时，归因置信度**最高只能到 `medium`**，除非有额外证据
+3. 输出为 `assertion_mismatch` 时，归因置信度**最高只能到 `medium`**（M3 去掉原稿的"除非有额外证据"——那句话没有可执行定义，留着等于没有上限；见 §11.5）
 
 > 不为了让类别表"看起来干净"而拆成 `service_mismatch` 与 `test_assertion_error` 两类。这个区分（若需要）应由证据得出，而不是由模型猜测——猜出来的分类和 `unknown` 一样不可用。
 
@@ -207,7 +207,7 @@ class FallbackAttribution(BaseModel):
 
 | 情况 | 处理 |
 | :--- | :--- |
-| LLM **调用失败**（网络、限流、超时） | 重试 1 次（与其他模块一致的上限） |
+| LLM **调用失败**（网络、限流、超时） | 跟随 `llm_max_retries`（默认 2，由 `QwenProvider` 统一实现——原稿写"1 次"且声称"与其他模块一致"，而 `06` §7 与 PRD §4.3 都是 2 次；见 §11.5） |
 | LLM 成功返回但结论为 `unknown` | **不重试**，直接落库 |
 
 理由：`unknown` 意味着"信息不足以判断"，重试同一输入只会得到同样的结果，纯属烧钱。它应该作为 §3.4 的监控信号进入人工视野，而不是靠重试碰运气。
@@ -328,6 +328,88 @@ V1.0 的检索引入时机与验证方式：当**历史归因样本量足够**�
 
 ---
 
+## 11.5 M3 实现回写
+
+设计稿给的是分段与原则，实现时必须落到具体的 `rule_ref`、优先级整数与
+证据形状。以下为实现后的权威口径。
+
+### 规则目录（`agents/rules/attribution.py`）
+
+| priority | `rule_ref` | 命中条件 | 类别 | 置信度 |
+| ---: | :--- | :--- | :--- | :--- |
+| 10 | `guardrail.denied` | `error_kind == guardrail_denied` | `blocked_by_policy` | high |
+| 20 | `transport.timeout` | `status == timeout` 且 `error_kind == timeout` | `network_error` | high |
+| 30 | `transport.other` | `error_kind` ∈ `dns_failure` / `connection_refused` / `connection_reset` / `tls_error` / `transport_error` / `transport_*` | `network_error` | high |
+| 105 | `status.quota_body` | 403 且响应体含配额/限流文案 | `rate_limited` | medium |
+| 110 | `status.conflict` | 409 | `conflict` | high |
+| 120 | `status.rate_limited` | 429 | `rate_limited` | high |
+| 130 | `status.unauthorized` | 401 | `auth_error` | high |
+| 140 | `status.forbidden` | 403 | `auth_error` | high |
+| 150 | `status.bad_request` | 400 | `request_invalid` | high |
+| 160 | `status.unprocessable` | 422 | `request_invalid` | high |
+| 170 | `status.method_not_allowed` | 405 / 406 / 415 | `request_invalid` | high |
+| 210 | `body.validation_error` | 其余 4xx 且响应体是含 `errors`/`error`/`detail`/`violations` 的 JSON | `request_invalid` | medium |
+| 310 | `status.not_found` | 404 | `resource_not_found` | high |
+| 320 | `status.server_error` | 5xx | `server_error` | high |
+| 410 | `assertion.schema_valid` | 2xx 且有一条 `schema_valid` 断言 `outcome == failed` | `response_schema_mismatch` | high |
+
+**规则引擎不产出 `assertion_mismatch`**（§3.3 的落地）：该类别天然二义，
+规则没有能力区分"服务错了"与"用例断言写错了"。测试里有一条结构性断言
+遍历规则表，确保没有人后来加进去。
+
+**响应体特征规则在 `truncated = true` 时一律不匹配**：缺失的键可能正好
+在被截掉的部分（DM6 的同一条原则）。
+
+### 补记的超时（`executor_stall`）不参与归因
+
+`results.mark_unfinished_as_timeout` 补写的结果是"结果没回来"，不是测试
+结论。N6 在构造 `FailureContext` 之前就把它过滤掉；报告里单列为"未完成"，
+且**不进通过率分母**（RA3 的细化，见 `ReportAgent.md`）。
+
+### LLM 兜底
+
+- 输入见 §5.2；提示词里 `TRUNCATED:` 是**必填标记**，模型据此避免把
+  "字段在被截掉的部分里"误判成"字段缺失"。
+- 输出统一为 `domain.attribution.FallbackAttribution`（`extra="forbid"`，
+  `category` 是封闭枚举）。
+- **总预算 300 秒、并发 4**。串行调用可能让 N6 超过 Run 锁的 400 秒 TTL，
+  于是锁到期、另一个推进者重跑同一节点——同样的钱花两遍。
+- 预算耗尽或调用失败 → 该条落 `unknown`（`method="llm"`、`confidence="low"`），
+  并记 `NodeFailure`。**不允许失败用例没有归因行。**
+- `unknown` 不重试（LA7）。
+
+### 置信度封顶
+
+| 条件 | 上限 |
+| :--- | :--- |
+| `category = assertion_mismatch` 且用例 `confidence = high` | `medium` |
+| `category = assertion_mismatch` 且用例 `confidence = low / NULL` | `low` |
+| 响应体被截断 | `medium` |
+| `category = unknown` | `low` |
+
+用例置信度缺失按 `low` 处理——**缺值不能当成"不设限"**，否则上限恰好
+在证据最弱时失效。
+
+### 证据形状
+
+- 规则路径：`{"rule_ref", "status", "http_status", "error_kind", "truncated"}`
+- LLM 成功：`{"signals": [...], "reasoning": ..., "truncated": bool, "case_confidence": ...}`
+- LLM 失败/超预算：`{"reason": ..., "truncated": bool, "case_confidence": ...}`
+
+**证据里不含响应体**：它可能含凭证或用户数据。
+
+### 人工纠错
+
+- `PATCH /api/runs/{run_id}/attributions/{attribution_id}`
+- `disagree` 必须同时给出 `human_category`（LA6）；`agree` 不得带类别。
+- 三条约束下沉到数据库（`ck_attributions_confidence` /
+  `ck_attributions_human_category` / `ck_attributions_human_verdict_category`）：
+  应用层校验拦不住迁移脚本、手工 SQL 与其他写入方。
+- 重算归因时 upsert **只更新机器字段**，`human_*` 原样保留——否则
+  "重跑一次，人工纠错全没了"，而且不会报错。
+
+---
+
 ## 12. 开放问题
 
 | 编号 | 问题 | 影响 | 待决 |
@@ -366,3 +448,4 @@ V1.0 的检索引入时机与验证方式：当**历史归因样本量足够**�
 | :--- | :--- | :--- |
 | v0.1 | 2026-10-13 | 初稿：规则优先/LLM 兜底策略、规则覆盖率作为一等指标、10 类归因类别体系（解答 `04` Q2）、规则库优先级设计、LLM 兜底约束、与 TestCaseGen 置信度的交叉耦合、人工纠错与规则 backlog、检索为何排 V1.0，沉淀 LA1~LA7 |
 | v0.2 | 2026-10-13 | 归因类别由 10 类增至 **11 类**，新增 `blocked_by_policy`（由 `Guardrail.md` §8 暴露的缺口）——被安全策略拦截的请求既不属于服务缺陷也不属于网络问题，复用 `network_error` 会把用户引向错误的排查方向 |
+| v0.3 | 2026-10-17 | **M3 实现回写（新增 §11.5）**：① 把分段原则落成 15 条具体规则（`rule_ref` + 优先级 + 条件 + 置信度）；② 明确规则引擎**不产出** `assertion_mismatch`；③ 补记超时 `executor_stall` 不参与归因、不进通过率分母；④ 重试次数改为跟随 `llm_max_retries`（原稿"1 次"与 `06` §7 / PRD §4.3 冲突）；⑤ 删掉"除非有额外证据"的口子——没有可执行定义；⑥ 补 LLM 总预算 300 秒与并发 4，以及失败/超预算落 `unknown` 的约定；⑦ 固化三种证据形状；⑧ 人工纠错的三条数据库约束 |

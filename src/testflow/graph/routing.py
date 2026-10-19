@@ -67,7 +67,7 @@ def after_parse(state: GraphState) -> Literal["generate_cases", "__end__"]:
     return "generate_cases"
 
 
-def after_generate(state: GraphState) -> Literal["apply_decisions", "__end__"]:
+def after_generate(state: GraphState) -> Literal["review_gate", "__end__"]:
     """N2 之后。
 
     **部分成功不阻塞全局**——只要产出了至少一条用例就继续。
@@ -77,7 +77,7 @@ def after_generate(state: GraphState) -> Literal["apply_decisions", "__end__"]:
     """
     if not state.get("case_ids"):
         return "__end__"
-    return "apply_decisions"
+    return "review_gate"
 
 
 def after_decisions(state: GraphState) -> Literal["dispatch_cases", "__end__"]:
@@ -86,10 +86,6 @@ def after_decisions(state: GraphState) -> Literal["dispatch_cases", "__end__"]:
     用户把全部用例都丢弃时走终止——但那是**正常结束**，不是失败
     （`06` §4 明确：`END(DONE)`）。这一点很重要：一份"用户看过之后
     决定不测"的报告，和一份"平台没跑成"的报告，含义完全不同。
-
-    M1 没有 IP-1，所以这条分支实际上走不到（N3 无条件批准全部）。
-    保留它是因为 M2 插入确认门之后，它是**唯一**能表达"用户全否"的路径；
-    到那时再补，图的形状就要变了。
     """
     if not state.get("approved_case_ids"):
         return "__end__"

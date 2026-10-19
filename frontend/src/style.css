@@ -1,0 +1,135 @@
+/* 全局样式。**刻意不引 UI 框架**：这套界面只有三个页面、四五种控件，
+   而一个组件库会带来几百个包与一套需要跟着升级的主题约定——
+   对"上传、勾选、看报告"这三件事来说，那些成本换不到任何东西。
+
+   配色用 CSS 变量集中定义：低置信度的强调色在好几个地方用到，
+   散落的十六进制值迟早会变得不一致。 */
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --line: #dfe3e8;
+  --text: #1f2328;
+  --muted: #6b7280;
+
+  --accent: #2563eb;
+  --accent-soft: #eff4ff;
+
+  /* 低置信度 = "期望值有一部分靠推断"。橙色而不是红色：
+     它不是错误，只是**需要人多看一眼**。 */
+  --warn: #b45309;
+  --warn-soft: #fff7ed;
+
+  --danger: #b91c1c;
+  --ok: #15803d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+h1 {
+  font-size: 1.35rem;
+  margin: 0 0 0.25rem;
+}
+h2 {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0 0 0.75rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+textarea {
+  width: 100%;
+  min-height: 12rem;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.82rem;
+  padding: 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.badge.warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.badge.method {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+/* 错误框：**显示原文**。截断或改写成"操作失败"会让用户
+   失去唯一能定位问题的信息（比如文档第 42 行的 $ref 悬空）。 */
+.alert {
+  border-radius: 6px;
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--danger);
+  background: #fef2f2;
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+.alert.warn {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}

@@ -47,10 +47,8 @@ import httpx
 
 from testflow.guardrail.errors import (
     GuardrailError,
-    GuardrailTimeout,
-    GuardrailTransportError,
     PeerVerificationError,
-    classify_transport_error,
+    translate_transport_error,
 )
 
 __all__ = [
@@ -106,6 +104,10 @@ def _map_errors() -> Iterator[None]:
     具体的失败原因（超时 / DNS / TLS / 连接被拒）在这里就分类好挂在异常上
     带出去。那是**传输层的知识**，放在这里比让执行器再走一遍
     `__cause__` 链更合适。
+
+    "认哪些类型"是这里的判断（`_ERROR_MAP`），"认出来之后叫它什么"交给
+    `errors.translate_transport_error`——**异步路径要用同一套归类**，
+    见那个函数的文档字符串。
     """
     try:
         yield
@@ -114,17 +116,8 @@ def _map_errors() -> Iterator[None]:
             raise
         for core_type in _ERROR_MAP:
             if isinstance(exc, core_type):
-                raise _translate(exc) from exc
+                raise translate_transport_error(exc) from exc
         raise
-
-
-def _translate(exc: Exception) -> GuardrailTransportError:
-    kind = classify_transport_error(exc)
-    if kind == "timeout":
-        return GuardrailTimeout(str(exc))
-    error = GuardrailTransportError(str(exc))
-    error.error_kind = kind
-    return error
 
 
 def _normalize_host(value: str) -> str:

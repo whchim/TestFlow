@@ -98,6 +98,7 @@ asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
 markers = [
     "integration: 需要 PostgreSQL / Redis / 容器（Docker 未就绪时跳过）",
+    "security: Guardrail 对抗性测试（TS4 / TS8）",
 ]
 
 [tool.coverage.run]

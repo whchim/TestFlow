@@ -36,6 +36,7 @@ from testflow.gateway.auth import require_internal_token
 from testflow.gateway.deps import GatewayContext
 from testflow.gateway.schemas import WakeResponse
 from testflow.observability.logging import get_logger
+from testflow.storage.repositories import cases as cases_repo
 from testflow.storage.repositories import results as results_repo
 from testflow.storage.repositories import runs as runs_repo
 
@@ -90,8 +91,22 @@ async def wake_run(run_id: str, request: Request) -> WakeResponse:
         if run is None or RunPhase(run.phase).is_terminal:
             return WakeResponse(status="pending")
 
+        # ★★ **完成判定必须查权威表，不能读 `runs.expected_case_count`**（DM5）。
+        #
+        # 第一版读的是那个派生缓存，而**没有任何节点维护它**——它恒为 0。
+        # 于是这里的条件是 `expected == 0` → 永远返回 `pending`，
+        # **回调唤醒整条路径是死的**：每条用例完成时的唤醒全部空转，
+        # Run 只能靠兜底轮询往前挪。
+        #
+        # 这个 bug 的表现是**慢**而不是错（Run 最终会完成），
+        # 所以它不会被任何测试或告警抓住——只有把服务跑起来、
+        # 看着 `awaiting_results` 干等十几秒才看得出来。
+        #
+        # `04` DM5 把这条规则写得很直白："任何正确性判断一律以
+        # `SELECT count(*)` 查询 `case_results` 为准"。这里原先违反了它，
+        # 而违反的代价恰好落在"该推进时不推进"上——那是 DM5 举的反例本身。
         settled = results_repo.count_results(session, parsed)
-        expected = run.expected_case_count
+        expected = cases_repo.count_dispatchable(session, parsed)
     finally:
         session.close()
 

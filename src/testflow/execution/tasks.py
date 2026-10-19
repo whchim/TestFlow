@@ -30,7 +30,6 @@ Worker 是**长驻进程**，连接池与出站客户端的构造代价要付一
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,14 +41,13 @@ from testflow.celery_app import EXEC_QUEUE
 from testflow.config import Settings, load_settings
 from testflow.execution.credentials import CredentialError, CredentialMaterial, decrypt_value
 from testflow.execution.runner import WakeCallback, run_case
-from testflow.guardrail.audit import AuditRecord
 from testflow.guardrail.pipeline import EgressPolicy
 from testflow.guardrail.policy import Whitelist
 from testflow.guardrail.sync_client import GuardrailSyncClient
 from testflow.observability.logging import get_logger
 from testflow.observability.tracing import bind_trace_id
+from testflow.storage.audit_sink import make_audit_sink
 from testflow.storage.db import create_db_engine, create_session_factory
-from testflow.storage.repositories import audit as audit_repo
 from testflow.storage.repositories import credentials as credentials_repo
 from testflow.storage.repositories import runs as runs_repo
 from testflow.storage.repositories import specs as specs_repo
@@ -89,43 +87,11 @@ def _build_context() -> _WorkerContext:
         #
         # 发现它靠的是**跑完 demo 之后去查那张表**——那一步不做，
         # 这个洞会一直留着。写完一个"记录审计"的功能，要去看记录有没有真的产生。
-        guardrail=GuardrailSyncClient(settings, audit_sink=_audit_sink(sessions)),
+        #
+        # 回调本体在 `storage/audit_sink.py`：M2 起 LLM 那条路径
+        # （`graph/tasks.py`）也要用它，而两份实现会各自演化。
+        guardrail=GuardrailSyncClient(settings, audit_sink=make_audit_sink(sessions)),
     )
-
-
-def _audit_sink(sessions: sessionmaker[Session]) -> Callable[[AuditRecord], None]:
-    """把审计记录写进库。**用独立的短事务。**
-
-    不复用执行任务的事务：审计要回答的是"我们放没放行这次请求"，
-    而那件事在请求发出的那一刻就已经确定了。把它绑进任务事务的话，
-    任务因为任何原因回滚，**连同那条日志一起消失**——
-    而"某次出站曾经发生过"不依赖任务成功与否。
-    """
-
-    def _write(record: AuditRecord) -> None:
-        try:
-            with sessions() as session:
-                audit_repo.record(
-                    session,
-                    direction=record.direction,
-                    target_host=record.target_host,
-                    target_url=record.target_url,
-                    decision=record.decision,
-                    deny_reason=record.deny_reason,
-                    run_id=record.run_id,
-                    request_digest=record.request_digest,
-                    trace_id=record.trace_id,
-                )
-                session.commit()
-        except Exception:  # noqa: BLE001
-            # **审计写失败不能带崩执行。** 一次业务请求的成功与否不该取决于
-            # 日志存储的可用性——但必须留下痕迹，否则"审计静默失效"这件事
-            # 会以"表一直是空的"这种最难注意到的形式存在。
-            logger.exception(
-                "审计写入失败 host=%s decision=%s", record.target_host, record.decision
-            )
-
-    return _write
 
 
 def _get_context() -> _WorkerContext:
@@ -185,10 +151,22 @@ def exec_case(run_id: str, case_id: str) -> dict[str, Any]:
             policy=policy,
             settings=context.settings,
             load_credential=lambda host: _load_credential(session, context.settings, host),
-            wake=_wake,
         )
-        # **先落库再回调**（D4）。`run_case` 内部已经 flush 过回调，
-        # 这里 commit 把整条用例的结果固化下来。
+        # ★★ **提交必须在唤醒之前，而且中间不能夹别的东西。**
+        #
+        # D4 的"先落库再回调"，在**跨进程**的意义上指的是 `commit`，不是 `flush`。
+        # 第一版把 `wake` 放在 `run_case` 内部（那里只 flush）——于是：
+        #
+        #     结果只在本事务里可见 → Worker 发出唤醒 → Gateway 用**自己的**
+        #     会话查 `case_results` → 数不到这一条 → 判定"还没到齐" → pending
+        #
+        # 每一次回调都如此，于是**回调唤醒整条路径从来没生效过**：
+        # Run 只能靠兜底轮询（每分钟一次）往前挪。
+        #
+        # 这个 bug 与"`expected_case_count` 恒为 0"是**两个独立的原因**，
+        # 任何一个单独存在都会让唤醒失效——所以修掉其中一个，观察到的现象
+        # 不会有任何变化。**两个都修完才看得出来**，而"改了一处没变"
+        # 恰好会让人得出"改了也没用"的错误结论。
         session.commit()
     except Exception:
         session.rollback()
@@ -199,6 +177,12 @@ def exec_case(run_id: str, case_id: str) -> dict[str, Any]:
         raise
     finally:
         session.close()
+
+    # ★ 唤醒放在事务**外面**，而且是 commit 之后。
+    #
+    # 它不参与事务的成败：投递失败不该让一个已经成功的用例变成失败任务
+    # （结果是权威的，已经在库里了），而兜底轮询会把漏掉的唤醒补上。
+    _wake(run_uuid)
 
     return {"run_id": run_id, "case_id": case_id, "status": outcome.status}
 
@@ -269,11 +253,31 @@ def _wake(run_id: uuid.UUID) -> None:
     回调为 `None` 时**什么都不做**——此时只能靠兜底轮询收尾。
     那条路径必须能独立工作（M1 专项检查 a 就验证它），
     因为回调可能全部丢失。
+
+    ## ★ 回调抛异常必须被吞掉
+
+    第一版让它直接往上冒，而 `exec_case` 里那次调用在 `try` 之外、
+    却仍在这个**任务体**里——于是 Gateway 一次抖动会让任务以失败告终。
+    `acks_late=True` 下，任务失败会被**重投**，而重投意味着
+    **把这个用例再执行一遍**：对被测系统多打一次请求。
+
+    也就是说，"唤醒发不出去"这个**不影响正确性**的问题（结果已经提交，
+    兜底轮询会补上），被放大成了"对用户系统多打一份流量"。
+    代价的方向反了：通知可以丢，事实不能重复。
+
+    所以这里只记日志。**日志级别是 error 而不是 warning**：唤醒持续失败
+    意味着 Gateway 或网络有问题，那是运维该看见的事——而它唯一的症状
+    本来就是"Run 变慢了"，那太容易被忽略过去。
     """
     if _wake_callback is None:
         logger.debug("未注册唤醒回调，本任务的结果将依赖兜底轮询收尾 run=%s", run_id)
         return
-    _wake_callback(run_id)
+    try:
+        _wake_callback(run_id)
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring：通知失败不该让用例失败
+        logger.error(
+            "唤醒失败 run=%s（结果已落库，兜底轮询会收尾）：%s", run_id, type(exc).__name__
+        )
 
 
 _wake_callback: WakeCallback | None = None

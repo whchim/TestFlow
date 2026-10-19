@@ -13,11 +13,16 @@ GR6（审计脱敏）、`02` D2（LLM 出站同样经 Guardrail）。
 
 from __future__ import annotations
 
+import httpcore2
 import httpx2
 import pytest
 
 from testflow.guardrail.audit import redact_url, request_digest
-from testflow.guardrail.errors import GuardrailError
+from testflow.guardrail.errors import (
+    GuardrailError,
+    GuardrailTimeout,
+    GuardrailTransportError,
+)
 from testflow.guardrail.pipeline import EgressPolicy, RequestContext, SendPlan, evaluate
 from testflow.guardrail.policy import Decision, Whitelist
 from testflow.guardrail.ratelimit import RateLimiter
@@ -362,6 +367,24 @@ class TestLlmEgressAllowlist:
             await client.get("https://evil.example.com/v1/chat")
         assert recorded == [], "被拒绝的请求不该到达底层传输层"
 
+    async def test_denied_address_is_audited_before_raising(self, make_settings, captured) -> None:
+        """GR6：**`deny` 也要记。**
+
+        "必须报错"和"必须留痕"不冲突。抛出去之后就没有第二次机会了，
+        而"我们曾试图往哪儿发"恰恰是安全复盘时最该能回答的问题——
+        一条被拒绝的 LLM 出站说明某个模块在用错客户端，值得留下时间点。
+        """
+        settings = make_settings(llm_base_url="https://llm.example.com/v1")
+        client, _ = self._client(settings, captured, "llm.example.com:443")
+
+        with pytest.raises(GuardrailError, match="不在允许范围内"):
+            await client.get("https://evil.example.com/v1/chat")
+
+        assert [r.decision for r in captured] == ["deny"]
+        assert captured[0].deny_reason == "whitelist"
+        assert captured[0].direction == "llm", "两条出站路径靠这个字段区分"
+        assert captured[0].target_host == "evil.example.com"
+
     def test_policy_is_derived_from_the_configured_base_url(self, make_settings) -> None:
         """白名单从 `llm_base_url` **派生**，而不是另加一个配置项。
 
@@ -373,3 +396,91 @@ class TestLlmEgressAllowlist:
         settings = make_settings(llm_base_url="https://llm.example.com/v1")
         targets = {str(t) for t in llm_egress_policy(settings).whitelist.targets}
         assert targets == {"https://llm.example.com:443"}
+
+
+def _raising_client(exc: BaseException) -> httpx2.AsyncClient:
+    """构造一个"一请求就抛"的客户端。**用 MockTransport 顶掉真实传输层。**"""
+
+    class _Raiser(httpx2.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+            raise exc
+
+    from testflow.guardrail.async_client import _AllowlistAsyncTransport
+
+    return httpx2.AsyncClient(
+        transport=_AllowlistAsyncTransport(
+            allowed_host_port="llm.example.com:443",
+            delegate=_Raiser(),
+        ),
+        follow_redirects=False,
+    )
+
+
+class TestLlmTransportErrorMapping:
+    """异步路径的传输异常必须**归类成本项目自己的类型**（对齐 sync）。
+
+    ## 为什么这不是"整洁"问题
+
+    实测确认：原始 `httpcore2.ConnectError` 会**原样穿透 `openai` SDK**
+    ——它的 `request_exceptions()` 只认 `httpx2` 的类型，而 `httpcore2`/`httpx2`
+    是两个独立的异常体系。所以少了这层翻译，调用方拿到的既没有 `error_kind`、
+    也匹配不上 `GuardrailTransportError`。
+
+    而 `llm/qwen.py` 的**重试策略正挂在异常类型上**。少翻译一种异常的表现不是
+    报错，而是"这个错从不重试"——它只会表现为偶发失败率偏高，看不出来。
+    """
+
+    async def test_network_error_is_translated_with_a_kind(self) -> None:
+        """连接被拒要能归出 `connection_refused`——执行器据此填 `error_kind`。"""
+        refused = ConnectionRefusedError(10061, "connection refused")
+        exc = httpcore2.ConnectError("refused")
+        exc.__cause__ = refused
+
+        with pytest.raises(GuardrailTransportError) as caught:
+            await _raising_client(exc).get("https://llm.example.com/v1/chat")
+
+        assert caught.value.error_kind == "connection_refused"
+
+    async def test_timeout_is_translated_to_the_timeout_subtype(self) -> None:
+        """**超时必须落进 `GuardrailTimeout` 这个子类**，而不是笼统的传输错误。
+
+        这个区分决定重试与否（`qwen.generate` 不重试超时：三次 120 秒超时
+        = 360 秒，超过编排层的锁 TTL）。归错了的表现是"超时也会重试"，
+        而那正是设 `max_retries=0` 要避免的事。
+
+        `__cause__` 链上的内建 `TimeoutError` 是真实链路的样子：
+        `httpcore2` 用 `raise TimeoutException(exc) from exc` 包装
+        （见 `httpcore2/_exceptions.py::map_exceptions`）。
+        """
+        exc = httpcore2.ConnectTimeout("timed out")
+        exc.__cause__ = TimeoutError("timed out")
+
+        with pytest.raises(GuardrailTimeout) as caught:
+            await _raising_client(exc).get("https://llm.example.com/v1/chat")
+
+        assert caught.value.error_kind == "timeout"
+
+    async def test_httpx2_errors_are_also_translated(self) -> None:
+        """默认 delegate 是 `httpx2.AsyncHTTPTransport`，它把 httpcore2 包成
+        `httpx2.*` 再抛——所以**两套类型都得认**。
+
+        只认 httpcore2 的话，真实路径（默认 delegate）上的错误反而漏掉。
+        """
+        with pytest.raises(GuardrailTransportError):
+            await _raising_client(httpx2.ConnectError("refused")).get(
+                "https://llm.example.com/v1/chat"
+            )
+
+    async def test_unrelated_errors_are_not_translated(self) -> None:
+        """**不能吞掉一切。** 一个编程错误被归成"网络故障"，
+        会让排查方向从"我们的 bug"变成"网线有问题"。"""
+        with pytest.raises(RuntimeError, match="我们自己写错了"):
+            await _raising_client(RuntimeError("我们自己写错了")).get(
+                "https://llm.example.com/v1/chat"
+            )
+
+    async def test_guardrail_errors_pass_through_untouched(self) -> None:
+        """Guardrail 自己的异常不该被再包一层——那会让 `error_kind` 丢掉。"""
+        with pytest.raises(GuardrailError, match="平台故障") as caught:
+            await _raising_client(GuardrailError("平台故障")).get("https://llm.example.com/v1/chat")
+        assert type(caught.value) is GuardrailError

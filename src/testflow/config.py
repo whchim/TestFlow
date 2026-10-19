@@ -59,7 +59,11 @@ class Settings(BaseSettings):
     database_url: str
     db_pool_size: int = 5
 
-    redis_url: str = "redis://localhost:6379"
+    # 用 `127.0.0.1` 而不是 `localhost`：在部分环境里（Windows 的 hosts
+    # 解析优先 IPv6）`localhost` 会先解析到 `::1`，而 Docker 只把端口发布
+    # 在 IPv4 的 127.0.0.1 上——结果是连接一直等到超时，看起来像 Redis 挂了。
+    # `/readyz` 的集成测试在 M5 就撞上了这个（`redis.exceptions.TimeoutError`）。
+    redis_url: str = "redis://127.0.0.1:6379"
     # 必须分库（02 §6 / ADR-0009）：混用同一 DB 会让 FLUSHDB 类运维操作
     # 误删对方数据，且二者的淘汰策略需求不同。
     redis_broker_db: int = 0
@@ -79,6 +83,29 @@ class Settings(BaseSettings):
     llm_model: str = "qwen3.5-plus"
     llm_timeout_s: int = 120
     llm_max_retries: int = 2
+
+    # 思考模式按用途分开。**默认值来自 M4 实测，不是设计稿的推测**：
+    #
+    #   qwen3.7-flash · 5 个接口 × 2 轮（样本 n=10）
+    #   thinking=on ：首次通过 67%，输出 8,864 token，P95 ≈ 57s，¥0.0077/2 次
+    #   thinking=off：首次通过 100%，输出 1,215 token，P95 ≈ 8s，¥0.0014/3 次
+    #
+    # 思考模式把延迟推到验收线（P95 ≤ 30s）之外，输出 token 是 7 倍，
+    # 且首次通过率更低。`02` §5.3 原定"生成开、归因关"被这组数据推翻——
+    # 生成也不需要思考：维度清单已经由阶段 A 确定性派生，模型只填取值。
+    llm_enable_thinking_generation: bool = False
+    llm_enable_thinking_attribution: bool = False
+
+    # 采样参数。`None` 表示"不传，用提供商默认值"——传一个猜测值比不传更糟：
+    # 它会让 M5 的 Golden Set 比较失去"默认基线"。M4 的基准脚本负责实测。
+    llm_temperature: float | None = None
+    llm_top_p: float | None = None
+    llm_seed: int | None = None
+    llm_max_tokens: int | None = None
+
+    # 单价覆盖。键是模型名，值是按输入长度升序的档位列表。默认表在
+    # `llm/pricing.py`（代码里可 review、可测试）；这里只用于不改代码地纠偏。
+    llm_pricing_overrides: dict[str, list[dict[str, float]]] = Field(default_factory=dict)
 
     # ---------------------------------------------------------- Guardrail
     # 仅阈值与白名单。安全底线见模块 docstring。

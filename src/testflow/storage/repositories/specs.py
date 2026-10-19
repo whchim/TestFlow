@@ -12,14 +12,16 @@
 
 from __future__ import annotations
 
+import datetime
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
-from testflow.storage.models import Spec
+from testflow.storage.models import Run, Spec
 
-__all__ = ["get", "get_by_fingerprint", "insert"]
+__all__ = ["delete_orphans_older_than", "get", "get_by_fingerprint", "insert"]
 
 
 def get(session: Session, spec_id: uuid.UUID) -> Spec | None:
@@ -33,6 +35,59 @@ def get_by_fingerprint(session: Session, fingerprint: str) -> Spec | None:
     查询走 `fingerprint` 上的 UNIQUE 索引，代价恒定。
     """
     return session.scalars(select(Spec).where(Spec.fingerprint == fingerprint)).one_or_none()
+
+
+def delete_orphans_older_than(
+    session: Session,
+    *,
+    cutoff: datetime.datetime,
+    batch_size: int = 500,
+) -> int:
+    """删除**没有任何 Run 引用**且早于 `cutoff` 的 Spec（`04` §5 / `10` §7）。
+
+    ## 为什么必须单独判断"孤儿"
+
+    Spec 不随 Run 级联删除——它可能被多个 Run 复用。反过来，一个 Spec
+    只有在**引用它的最后一个 Run 也被清掉之后**才成为孤儿。所以清理顺序
+    是先 Run、后 Spec；否则一个刚过期 Run 的 Spec 会多活一天。
+
+    `NOT EXISTS` 而不是 `LEFT JOIN ... IS NULL`：前者语义更直白——
+    "不存在任何引用"，并且能走 `ix_runs_spec_id`（PostgreSQL **不会**为
+    外键自动建索引，那个索引是 M5 清理任务的一部分）。
+
+    ## 并发新建 Run 的窗口
+
+    查询与删除之间如果恰好有人为这个 Spec 创建了 Run，数据库会因外键
+    （`runs.spec_id` 无级联、默认 RESTRICT）拒绝这次删除，而不是造成
+    悬空引用。清理任务在下一个周期会重新判断。这比"先删再用"安全：
+    **失败一次无副作用，错误地删掉则有。**
+
+    按批删除的理由与 `runs.delete_older_than` 相同。
+    """
+    total = 0
+    while True:
+        referenced = exists(select(Run.id).where(Run.spec_id == Spec.id))
+        ids = list(
+            session.scalars(
+                select(Spec.id)
+                .where(Spec.created_at < cutoff, ~referenced)
+                .order_by(Spec.created_at)
+                .limit(batch_size)
+            )
+        )
+        if not ids:
+            break
+
+        result = session.execute(
+            sa_delete(Spec).where(Spec.id.in_(ids)),
+            execution_options={"synchronize_session": False},
+        )
+        session.flush()
+        deleted = int(getattr(result, "rowcount", 0) or 0)
+        total += deleted
+        if deleted == 0:
+            break
+    return total
 
 
 def insert(session: Session, spec: Spec) -> Spec:

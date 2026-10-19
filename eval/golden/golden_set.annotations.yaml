@@ -1,0 +1,157 @@
+# Golden Set 的人工标注（`docs/09-测试策略.md` §5.3）。
+#
+# ⚠️ **这份标注必须独立于代码写。**
+#
+# 它的全部价值来自"不是平台自己算的"：如果 `expected_dimensions` 由
+# `derive_dimensions()` 跑一遍再复制过来，那 L3 就退化成了"代码和自己比"，
+# 分母的盲区永远发现不了（§5.2）。所以这里按 `03/TestCaseGen.md` §2.3 的
+# 维度表逐字段手写，然后再和实现比对。
+#
+# 修改规则：
+#   * 改 `golden_set.yaml` 的接口 → 必须同步改这里
+#   * 实现了新维度类型 → 先确认维度表里确实有它，再改这里
+#   * `expected_dimensions` 是**集合语义**，顺序无关
+version: 1
+annotated_by: manual
+notes: |
+  10 个接口各自检验一种会让派生算法出错的 schema 特征。第一层指标
+  （派生正确性）只依赖本文件与阶段 A，不需要 LLM，因此可以进 CI
+  （`tests/unit/test_golden_set.py`）。带 `--generate` 的 L3 跑生成质量，
+  成本真实，按 EN8 手动触发。
+
+operations:
+  - method: GET
+    path: /items/{item_id}
+    expected_dimensions:
+      - value_valid
+      # 参数化路径 ⇒ 资源不存在。Spec 没声明 404，所以期望值是推断的。
+      - not_found
+    expected_client_error_codes: []
+    pure_rule: false
+    notes: 基础路径；只有路径参数，不派生字段级维度。
+
+  - method: POST
+    path: /users
+    expected_dimensions:
+      - value_valid
+      - required_missing:email
+      - type_mismatch:email
+      - required_missing:name
+      - type_mismatch:name
+    expected_client_error_codes: [400]
+    pure_rule: false
+    notes: |
+      必填字段每个派生两条（缺失 + 类型错误）。可选字段 nickname 不派生
+      required_missing——它不是必填的，缺省是合法请求。
+
+  - method: POST
+    path: /accounts
+    expected_dimensions:
+      - value_valid
+      - constraint_violation:code
+      - constraint_violation:role
+    expected_client_error_codes: [422]
+    pure_rule: false
+    notes: |
+      enum 与 pattern 都归在 constraint_violation 名下（维度表 §2.3）。
+      **pattern 是这条标注的要点**：第一版派生只认 enum，带正则的字段
+      会静默消失，而覆盖率仍然 100%。
+
+  - method: POST
+    path: /products
+    expected_dimensions:
+      - value_valid
+      - boundary:price:min
+      - boundary:price:min_over
+      - boundary:price:max
+      - boundary:price:max_over
+      - constraint_violation:quantity
+      - boundary:quantity:min
+      - boundary:quantity:min_over
+      - boundary:quantity:max
+      - boundary:quantity:max_over
+    expected_client_error_codes: [400]
+    pure_rule: false
+    notes: |
+      每个数值边界派生两条：边界值本身应当被接受、越界值应当被拒绝。
+      只测其中一条会让"任何值都拒绝"的实现通过。quantity 另有 multipleOf，
+      同样属于 constraint_violation。
+
+  - method: POST
+    path: /profiles
+    expected_dimensions:
+      - value_valid
+      - boundary:bio:len_min
+      - boundary:bio:len_min_over
+      - boundary:bio:len_max
+      - boundary:bio:len_max_over
+    expected_client_error_codes: [400]
+    pure_rule: false
+    notes: |
+      **最容易漏的一类**：长度约束藏在 type: string 的兄弟字段里，
+      不像 minimum/maximum 那样显眼。只测第 4 号接口会误以为边界已覆盖。
+
+  - method: POST
+    path: /orders
+    expected_dimensions:
+      - value_valid
+      - required_missing:billing
+      - type_mismatch:billing
+      - required_missing:shipping
+      - type_mismatch:shipping
+    expected_client_error_codes: [400]
+    pure_rule: false
+    notes: |
+      两个字段引用同一个 Address，检验 $ref 展开与复用。阶段 A 只从请求体
+      **顶层** properties 派生维度，Address 内部的 street/city 不单独派生——
+      这是当前的刻意边界（组合爆炸），不是漏项。展开正确性另由
+      "has_unresolved_ref 必须为 false" 检查。
+
+  - method: GET
+    path: /invoices/{invoice_id}
+    expected_dimensions:
+      - value_valid
+      - not_found
+      - status:400
+      - status:401
+      - status:409
+    expected_client_error_codes: [400, 401, 404, 409]
+    pure_rule: false
+    notes: |
+      声明的 4xx 每个都要有对应用例。404 已由 not_found 覆盖，不重复派生
+      status:404；其余三个各派一条。这是 L2"声明的 4xx 必须被覆盖"的
+      独立基准。
+
+  - method: GET
+    path: /reports/summary
+    expected_dimensions:
+      - value_valid
+    expected_client_error_codes: []
+    pure_rule: false
+    low_confidence_dimensions: [value_valid]
+    notes: |
+      响应没有 schema ⇒ 内容断言无从派生，只剩状态码 ⇒ 低置信度
+      （§7 触发 ⑤）。有 query 参数，所以不是纯规则路径。
+
+  - method: GET
+    path: /health
+    expected_dimensions:
+      - value_valid
+    expected_client_error_codes: []
+    pure_rule: true
+    notes: |
+      **TG5 的检验点**：无参数、无请求体、无 4xx 声明。这条路径必须
+      产生 0 次 LLM 调用——它出现在调用记录里就说明 TG5 没实现。
+
+  - method: POST
+    path: /devices
+    expected_dimensions:
+      - value_valid
+      - constraint_violation:serial
+    expected_client_error_codes: []
+    pure_rule: false
+    low_confidence_dimensions: [constraint_violation:serial]
+    notes: |
+      format: imei 是自定义格式：阶段 A 知道"应当拒绝不符合格式的值"，
+      但无法确定什么值算不符合——该用例标低置信度（§7 触发 ④）。
+      **不得凭空发明其他维度**：未知语义的降级是"降低确定性"，不是"猜更多"。

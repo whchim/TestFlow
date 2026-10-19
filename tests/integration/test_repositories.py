@@ -250,7 +250,19 @@ class TestResultsUpsert:
 
 
 class TestMarkUnfinishedAsTimeout:
-    """`06` §6.4：回调可能全部丢失，系统不能无限等下去。"""
+    """`06` §6.4：回调可能全部丢失，系统不能无限等下去。
+
+    ## ⚠️ 本类里所有用例都**必须**是 `approved` 的
+
+    这不是为了迁就实现——`mark_unfinished_as_timeout` 补记的是"**该执行**
+    却没有结果"的用例，而"该执行"的定义就是 N4 会投递的那些：
+    `review_status == 'approved'` 且非破坏性。
+
+    第一版这里用的是默认的 `pending` 用例，于是它验的其实是"所有用例都会
+    被补记"——而那条规则在 IP-1 落地之后就是**错的**：
+    一个被用户拒绝的用例会因此被写成 `timeout`，即"我们发了请求但没等到回应"。
+    见下面 `TestNonDispatchableCasesAreNeverMarkedTimeout`。
+    """
 
     def test_unfinished_cases_become_timeout(
         self, session, make_spec, make_operation, make_run, make_case
@@ -258,8 +270,8 @@ class TestMarkUnfinishedAsTimeout:
         spec = make_spec()
         op = make_operation(spec)
         run = make_run(spec)
-        done = make_case(run, op, name="已执行")
-        missing = make_case(run, op, name="回调丢了")
+        done = make_case(run, op, name="已执行", review_status="approved")
+        missing = make_case(run, op, name="回调丢了", review_status="approved")
 
         results_repo.upsert_many(
             session, [{"run_id": run.id, "case_id": done.id, "status": "passed"}]
@@ -276,7 +288,7 @@ class TestMarkUnfinishedAsTimeout:
         spec = make_spec()
         op = make_operation(spec)
         run = make_run(spec)
-        make_case(run, op)
+        make_case(run, op, review_status="approved")
 
         assert results_repo.mark_unfinished_as_timeout(session, run.id) == 1
         assert results_repo.mark_unfinished_as_timeout(session, run.id) == 0
@@ -288,12 +300,106 @@ class TestMarkUnfinishedAsTimeout:
         spec = make_spec()
         op = make_operation(spec)
         run = make_run(spec)
-        case = make_case(run, op)
+        case = make_case(run, op, review_status="approved")
         results_repo.upsert_many(
             session, [{"run_id": run.id, "case_id": case.id, "status": "passed"}]
         )
 
         assert results_repo.mark_unfinished_as_timeout(session, run.id) == 0
+
+
+class TestNonDispatchableCasesAreNeverMarkedTimeout:
+    """**"故意没发"与"发了没回应"是两回事。**
+
+    对应决策：RA2（报告必须显式列出没测什么）、RA3（通过率的分母只含
+    **已执行**用例）、TE3（破坏性用例不执行）、`06` §5.1（IP-1 决策）。
+
+    ## 为什么这一类要单独一个类
+
+    它的失效形态不是报错，而是**报告里出现一个凭空捏造的系统故障结论**：
+    "这个接口超时了"——而真相是用户看过那条用例、决定不跑它。
+    用户会照着这个结论去查一个不存在的问题，而排查方向从一开始就是错的。
+
+    这类"把主动跳过说成被动失败"的错误在 M1 是不可能出现的
+    （那时没有拒绝入口），它是 **IP-1 落地之后才变得可达的**。
+    """
+
+    def test_a_rejected_case_is_not_marked_timeout(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        """★ 被拒绝的用例**一条请求都没发出去**，不该有结果。
+
+        它应当出现在报告的"未执行清单"里（reason=`rejected`），
+        而不是失败清单里。
+        """
+        spec = make_spec()
+        op = make_operation(spec)
+        run = make_run(spec)
+        make_case(run, op, name="用户拒绝了", review_status="rejected")
+        make_case(run, op, name="批准了但回调丢了", review_status="approved")
+
+        filled = results_repo.mark_unfinished_as_timeout(session, run.id)
+
+        assert filled == 1, "只有已批准的那条该被补记"
+        rejected = cases_repo.list_by_run(session, run.id, review_status="rejected")[0]
+        assert results_repo.get(session, run.id, rejected.id) is None
+
+    def test_a_pending_case_is_not_marked_timeout(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        """未确认的用例同理——它从来没被投递过。"""
+        spec = make_spec()
+        op = make_operation(spec)
+        run = make_run(spec)
+        make_case(run, op, review_status="pending")
+
+        assert results_repo.mark_unfinished_as_timeout(session, run.id) == 0
+
+    def test_a_destructive_case_is_not_marked_timeout(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        """TE3：破坏性用例即便被批准也不会被执行（MVP 没有授权入口）。
+
+        这条在 M1 就有，这里保留下来是为了让"哪些用例不该有结果"的三条规则
+        出现在同一个地方——它们必须**一起**被维护。
+        """
+        spec = make_spec()
+        op = make_operation(spec, method="DELETE", path="/destructive")
+        run = make_run(spec)
+        make_case(run, op, is_destructive=True, review_status="approved")
+
+        assert results_repo.mark_unfinished_as_timeout(session, run.id) == 0
+
+
+class TestCountDispatchable:
+    """`count_dispatchable` 是完成判定的分母（`06` §6.2 / DM5）。
+
+    口径必须与 `dispatch_cases` 逐条对齐：**只有它会投递的用例才算
+    "应当有结果"**。多算一条，完成判定就永远差那么一条。
+    """
+
+    def test_it_counts_only_approved_non_destructive(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        spec = make_spec()
+        op = make_operation(spec)
+        destructive_op = make_operation(spec, method="DELETE", path="/destructive")
+        run = make_run(spec)
+
+        make_case(run, op, name="批准1", review_status="approved")
+        make_case(run, op, name="批准2", review_status="approved")
+        make_case(run, op, name="拒绝", review_status="rejected")
+        make_case(run, op, name="未确认", review_status="pending")
+        make_case(run, destructive_op, name="破坏性", review_status="approved", is_destructive=True)
+
+        assert cases_repo.count_dispatchable(session, run.id) == 2
+        assert cases_repo.count_by_run(session, run.id) == 5, "全部用例数是另一个口径"
+
+    def test_an_empty_run_is_zero(self, session, make_spec, make_run) -> None:
+        """0 是"还没到这一步"的信号——调用方据此不该推进（`internal.py`）。"""
+        spec = make_spec()
+        run = make_run(spec)
+        assert cases_repo.count_dispatchable(session, run.id) == 0
 
 
 class TestSpecFingerprintDedupe:
@@ -363,43 +469,57 @@ class TestRunOperationIdempotency:
 
 
 class TestCaseReview:
-    """M1 没有 IP-1，但 `review_status` 仍要写对——N3 的路由依据是它。"""
+    """`set_review_status`：IP-1 决策的落点（`06` §5.1）。
 
-    def test_approve_all_pending(
+    M2 起，批准 / 拒绝由决策接口计算 id 集合后调用本函数写库；N3 只**读**
+    `review_status == "approved"`。所以这里直接测批量写，而不是"全批"——
+    后者是 M1 没有确认门时的临时做法，已移除（路线图 Q1：临时即永久）。
+    """
+
+    def test_approve_batch_sets_status(
         self, session, make_spec, make_operation, make_run, make_case
     ) -> None:
         spec = make_spec()
         op = make_operation(spec)
         run = make_run(spec)
-        for i in range(3):
-            make_case(run, op, name=f"c{i}")
+        cases = [make_case(run, op, name=f"c{i}") for i in range(3)]
 
-        assert cases_repo.approve_all_pending(session, run.id) == 3
-        assert cases_repo.list_by_run(session, run.id, review_status="approved")
-
-    def test_rejected_cases_are_left_alone(
-        self, session, make_spec, make_operation, make_run, make_case
-    ) -> None:
-        """只批准 `pending`。若把已拒绝的也一并批准，用户的拒绝就白做了。"""
-        spec = make_spec()
-        op = make_operation(spec)
-        run = make_run(spec)
-        rejected = make_case(run, op, name="被拒绝的", review_status="rejected")
-        make_case(run, op, name="待审的")
-
-        assert cases_repo.approve_all_pending(session, run.id) == 1
+        assert cases_repo.set_review_status(session, [c.id for c in cases], "approved") == 3
         session.expire_all()
-        assert cases_repo.get(session, rejected.id).review_status == "rejected"
+        approved = cases_repo.list_by_run(session, run.id, review_status="approved")
+        assert {c.id for c in approved} == {c.id for c in cases}
 
-    def test_approve_is_idempotent(
+    def test_reject_batch_sets_status(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        spec = make_spec()
+        op = make_operation(spec)
+        run = make_run(spec)
+        case = make_case(run, op)
+
+        assert cases_repo.set_review_status(session, [case.id], "rejected") == 1
+        session.expire_all()
+        assert cases_repo.get(session, case.id).review_status == "rejected"
+
+    def test_empty_id_list_is_a_noop(
         self, session, make_spec, make_operation, make_run, make_case
     ) -> None:
         spec = make_spec()
         op = make_operation(spec)
         run = make_run(spec)
         make_case(run, op)
-        cases_repo.approve_all_pending(session, run.id)
-        assert cases_repo.approve_all_pending(session, run.id) == 0
+
+        assert cases_repo.set_review_status(session, [], "approved") == 0
+
+    def test_unknown_id_is_a_noop(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        spec = make_spec()
+        op = make_operation(spec)
+        run = make_run(spec)
+        case = make_case(run, op)
+
+        assert cases_repo.set_review_status(session, [case.id, uuid.uuid4()], "approved") == 1
 
 
 class TestRunForeignKeyCascade:

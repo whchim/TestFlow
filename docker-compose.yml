@@ -15,6 +15,11 @@ x-app-env: &app-env
   TESTFLOW_CREDENTIAL_ENCRYPTION_KEY: ${TESTFLOW_CREDENTIAL_ENCRYPTION_KEY:?必须设置凭证加密密钥}
   TESTFLOW_LLM_BASE_URL: ${TESTFLOW_LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
   TESTFLOW_LLM_API_KEY: ${TESTFLOW_LLM_API_KEY:-not-configured}
+  # 模型名必须**显式透传**。这个锚点是逐条列举的，而 `config.py` 里定义的
+  # 配置项不会自动进来——漏了它的表现是"改了 `.env` 却毫无效果"，
+  # 容器安静地用回 `config.py` 的默认值（与上方第 120 行那条 `GATEWAY_URL`
+  # 的漏项同一类，只是更隐蔽：那条至少会报错，这条不会）。
+  TESTFLOW_LLM_MODEL: ${TESTFLOW_LLM_MODEL:-qwen3.5-plus}
   # ★ 内网例外：**唯一的来源是这里**，永不从 Spec 派生（ADR-0018）。
   # 含 `fixture:9000` 是因为 demo 的被测对象在容器网络里——
   # 这正好让"例外机制"被日常使用，比专门为它写一条测试有力得多。
@@ -26,6 +31,9 @@ services:
     # PostgreSQL 18 提供原生 uuidv7()，避免应用侧生成时间有序 UUID
     # （04 DM8 允许两种，原生更好：索引局部性由数据库保证）。
     image: postgres:18-alpine
+    # 资源上限来自 `10` §9 的估算。**它是上限而不是预留**：单机部署下
+    # 一个跑飞的进程（例如一次超大查询）不该把宿主机一起拖死。
+    mem_limit: 512m
     environment:
       POSTGRES_USER: testflow
       POSTGRES_PASSWORD: testflow
@@ -53,6 +61,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    mem_limit: 256m
     # OP7：Redis 的数据是可丢弃的（Checkpoint 丢了可从 PG 重跑，
     # 见 ADR-0009），因此**刻意关闭持久化**——不为可丢的数据付持久化成本。
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -71,6 +80,7 @@ services:
   fixture:
     build: .
     command: ["testflow-fixture"]
+    mem_limit: 256m
     environment:
       # 让 fixture 监听所有接口，否则容器外（同一网络的其他容器）连不上——
       # 它默认绑环回，那是**安全默认**，这里为了演示显式放开。
@@ -85,6 +95,7 @@ services:
   gateway:
     build: .
     command: ["testflow-gateway"]
+    mem_limit: 256m
     environment:
       <<: *app-env
       TESTFLOW_BIND_HOST: "0.0.0.0"
@@ -106,6 +117,7 @@ services:
   orchestrator:
     build: .
     command: ["testflow-orchestrator"]
+    mem_limit: 512m
     environment: *app-env
     depends_on:
       postgres: {condition: service_healthy}
@@ -115,6 +127,7 @@ services:
   worker:
     build: .
     command: ["testflow-worker"]
+    mem_limit: 512m
     environment:
       <<: *app-env
       # Worker 要打 Gateway 的内部端点。容器里 `127.0.0.1` 是它自己，
@@ -130,6 +143,7 @@ services:
   beat:
     build: .
     command: ["testflow-beat"]
+    mem_limit: 128m
     environment: *app-env
     depends_on:
       redis: {condition: service_healthy}

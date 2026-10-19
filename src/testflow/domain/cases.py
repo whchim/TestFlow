@@ -73,6 +73,11 @@ class GeneratedCase(BaseModel):
     requires_auth: bool = True
 
     derived_from: DerivedFrom
+
+    confidence: Literal["high", "low"] | None = None
+    """生成方自报的置信度。`None` 表示交由确定性分类器 `_classify_confidence`
+    判定（`TestCaseGen.md` §7——低置信度由具体原因构成，不应由模型自由打分）。"""
+
     notes: str | None = None
     """生成理由，供人工复核。不参与任何判定。"""
 

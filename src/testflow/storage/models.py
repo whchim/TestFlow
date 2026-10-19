@@ -41,6 +41,7 @@ __all__ = [
     "Case",
     "CaseResult",
     "Credential",
+    "LLMUsage",
     "Operation",
     "Report",
     "Run",
@@ -79,6 +80,9 @@ class Spec(Base):
     """
 
     __tablename__ = "specs"
+    #: 孤儿清理按 `created_at` 扫描（`10` §7 / `04` §5）。Spec 数量远小于
+    #: Run，但"没有索引"会让每日清理的任务成本随历史线性增长。
+    __table_args__ = (Index("ix_specs_created_at", "created_at"),)
 
     id: Mapped[uuid.UUID] = _pk()
     #: sha256(规范化后的内容)。规范化在 `$ref` 展开**之后**进行（`04` DM2 / ADR-0012）
@@ -149,6 +153,12 @@ class Run(Base):
     __table_args__ = (
         # 兜底轮询的扫描依据（`06` §6.4）：按 phase + 超时时间找停滞的 Run
         Index("ix_runs_phase_updated_at", "phase", "updated_at"),
+        # 数据清理按 `created_at` 扫描（`04` §5 / `10` §7）。没有它，每日
+        # 清理会全表扫 `runs`——而 `runs` 正是那张最会变大的表。
+        Index("ix_runs_created_at", "created_at"),
+        # 孤儿 Spec 判定要反向探测 `runs.spec_id`。PostgreSQL **不会**为外键
+        # 自动建索引；没有它时每个 Spec 的 `NOT EXISTS` 都是一次全表扫。
+        Index("ix_runs_spec_id", "spec_id"),
         CheckConstraint(
             "phase IN ('init','parsing','generating','awaiting_review','dispatching',"
             "'awaiting_results','analyzing','reporting','done','failed','abandoned')",
@@ -351,6 +361,24 @@ class Attribution(Base):
             "human_verdict IS NULL OR human_verdict IN ('agree','disagree')",
             name="ck_attributions_human_verdict",
         ),
+        CheckConstraint(
+            "confidence IS NULL OR confidence IN ('high','medium','low')",
+            name="ck_attributions_confidence",
+        ),
+        CheckConstraint(
+            "human_category IS NULL OR human_category IN ("
+            "'request_invalid','auth_error','resource_not_found','conflict',"
+            "'rate_limited','server_error','response_schema_mismatch',"
+            "'assertion_mismatch','network_error','blocked_by_policy','unknown')",
+            name="ck_attributions_human_category",
+        ),
+        # LA6：`disagree` 必须同时记录正确类别；`agree` 不得带类别。
+        CheckConstraint(
+            "(human_verdict IS NULL AND human_category IS NULL) "
+            "OR (human_verdict = 'agree' AND human_category IS NULL) "
+            "OR (human_verdict = 'disagree' AND human_category IS NOT NULL)",
+            name="ck_attributions_human_verdict_category",
+        ),
         Index("ix_attributions_run", "run_id"),
     )
 
@@ -434,6 +462,65 @@ class AuditLog(Base):
     deny_reason: Mapped[str | None] = mapped_column(Text)
     request_digest: Mapped[str | None] = mapped_column(CHAR(64))
     trace_id: Mapped[str | None] = mapped_column(Text)
+
+
+# ========================================================== 2.9.1 llm_usage
+
+
+class LLMUsage(Base):
+    """每次模型调用的用量（M4）。见 `04` §2.11 / `TestCaseGen.md` §8.3。
+
+    ## 为什么单独一张表，而不是塞进 `audit_logs`
+
+    审计的 `allow` 记录写在**请求发出之前**——那时响应还不存在，token 数
+    自然也没有。而且它是安全日志（"我们放行了什么"），不该被回填业务指标。
+
+    ## 为什么不用 `reports.content` 就够了
+
+    报告里的聚合值可以放进 `content`，但**逐次调用的缓存命中与耗时**无法
+    从聚合值反推。M4 的验收（`cached_tokens > 0`、P95 ≤ 30s）要的正是
+    逐次数据。
+
+    ## 为什么要记 `attempt`
+
+    一次接口生成最多重试 2 次。不记尝试序号，就分不清"成本高"是因为
+    模型慢、还是因为第一版不合格又重来了两次——而这两者的处置完全不同。
+    """
+
+    __tablename__ = "llm_usage"
+    __table_args__ = (
+        CheckConstraint(
+            "purpose IN ('case_generation','attribution')", name="ck_llm_usage_purpose"
+        ),
+        CheckConstraint(
+            "prompt_tokens >= 0 AND completion_tokens >= 0 "
+            "AND cached_tokens >= 0 AND cache_write_tokens >= 0",
+            name="ck_llm_usage_tokens_nonnegative",
+        ),
+        # 缓存命中是输入的一部分。若这条不成立，成本公式会把同一批 token
+        # 算两次——而报告里的数字看起来仍然"合理"。
+        CheckConstraint("cached_tokens <= prompt_tokens", name="ck_llm_usage_cached_le_prompt"),
+        Index("ix_llm_usage_run", "run_id"),
+    )
+
+    #: 追加型日志，BIGSERIAL 更省空间（同 `audit_logs`）。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    #: 可为空：离线基准/无 Run 上下文时也要能记。
+    #: 用 CASCADE 而非 SET NULL——用量是**这个 Run 的成本**，Run 删了就没有
+    #: 保留意义（与审计相反：审计要回答"曾经发生过什么"）。
+    run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    #: 响应里实际返回的模型名——中转/别名可能换掉请求的那个名字。
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    trace_id: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime] = _created_at()
 
 
 # ========================================================= 2.10 credentials

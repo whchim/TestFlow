@@ -1,0 +1,775 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-10-17T12:49:59.631507+00:00",
+  "git_commit": "82ae435",
+  "git_dirty": true,
+  "model": "qwen3.7-flash",
+  "golden_set": "eval\\golden\\golden_set.yaml",
+  "golden_set_sha256": "929e062e3f9f61d31acab85d2ef9d92517e6a8451539489c82ee06c113a26911",
+  "annotations_sha256": "d3d8f214496d93835c0a9a699a637292a46599b6323cd0f5741bae42714b31ed",
+  "prompt_sha256": "0842f94d383122fd2d7478f2b908ad12ab44f5f3ca7d5629f69cba027665d292",
+  "repeat": 3,
+  "layer1": {
+    "operations": 10,
+    "expected_dimensions": 39,
+    "matched_dimensions": 39,
+    "coverage": 1.0,
+    "operations_ok": 10,
+    "missing": {},
+    "extra": {},
+    "status_missing": {},
+    "pure_rule_mismatch": [],
+    "unresolved_refs": []
+  },
+  "operations": [
+    {
+      "method": "GET",
+      "path": "/items/{item_id}",
+      "expected": [
+        "not_found",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "not_found"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "POST",
+      "path": "/users",
+      "expected": [
+        "required_missing:email",
+        "required_missing:name",
+        "type_mismatch:email",
+        "type_mismatch:name",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "required_missing:email",
+        "type_mismatch:email",
+        "required_missing:name",
+        "type_mismatch:name"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [
+        400
+      ],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "POST",
+      "path": "/accounts",
+      "expected": [
+        "constraint_violation:code",
+        "constraint_violation:role",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "constraint_violation:code",
+        "constraint_violation:role"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [
+        422
+      ],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "POST",
+      "path": "/products",
+      "expected": [
+        "boundary:price:max",
+        "boundary:price:max_over",
+        "boundary:price:min",
+        "boundary:price:min_over",
+        "boundary:quantity:max",
+        "boundary:quantity:max_over",
+        "boundary:quantity:min",
+        "boundary:quantity:min_over",
+        "constraint_violation:quantity",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "boundary:price:min",
+        "boundary:price:min_over",
+        "boundary:price:max",
+        "boundary:price:max_over",
+        "constraint_violation:quantity",
+        "boundary:quantity:min",
+        "boundary:quantity:min_over",
+        "boundary:quantity:max",
+        "boundary:quantity:max_over"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [
+        400
+      ],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "POST",
+      "path": "/profiles",
+      "expected": [
+        "boundary:bio:len_max",
+        "boundary:bio:len_max_over",
+        "boundary:bio:len_min",
+        "boundary:bio:len_min_over",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "boundary:bio:len_min",
+        "boundary:bio:len_min_over",
+        "boundary:bio:len_max",
+        "boundary:bio:len_max_over"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [
+        400
+      ],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "POST",
+      "path": "/orders",
+      "expected": [
+        "required_missing:billing",
+        "required_missing:shipping",
+        "type_mismatch:billing",
+        "type_mismatch:shipping",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "required_missing:billing",
+        "type_mismatch:billing",
+        "required_missing:shipping",
+        "type_mismatch:shipping"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [
+        400
+      ],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "GET",
+      "path": "/invoices/{invoice_id}",
+      "expected": [
+        "not_found",
+        "status:400",
+        "status:401",
+        "status:409",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "not_found",
+        "status:400",
+        "status:401",
+        "status:409"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [
+        400,
+        401,
+        404,
+        409
+      ],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "GET",
+      "path": "/reports/summary",
+      "expected": [
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "expected": [
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [],
+      "status_missing": [],
+      "pure_rule_expected": true,
+      "pure_rule_actual": true,
+      "unresolved_ref": false
+    },
+    {
+      "method": "POST",
+      "path": "/devices",
+      "expected": [
+        "constraint_violation:serial",
+        "value_valid"
+      ],
+      "derived": [
+        "value_valid",
+        "constraint_violation:serial"
+      ],
+      "missing": [],
+      "extra": [],
+      "declared_4xx": [],
+      "status_missing": [],
+      "pure_rule_expected": false,
+      "pure_rule_actual": false,
+      "unresolved_ref": false
+    }
+  ],
+  "layer2": [
+    {
+      "thinking": false,
+      "result": {
+        "rounds": [
+          {
+            "round": 0,
+            "rows": [
+              {
+                "method": "POST",
+                "path": "/accounts",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 3,
+                "covered": 3,
+                "requested": 3,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/devices",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 2,
+                "covered": 2,
+                "requested": 2,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/health",
+                "llm_called": false,
+                "first_pass": true,
+                "case_count": 1,
+                "covered": 1,
+                "requested": 1,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": true,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/invoices/{invoice_id}",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/items/{item_id}",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 2,
+                "covered": 2,
+                "requested": 2,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/orders",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/products",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 10,
+                "covered": 10,
+                "requested": 10,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/profiles",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/reports/summary",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 1,
+                "covered": 1,
+                "requested": 1,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/users",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              }
+            ],
+            "first_pass_rate": 1.0,
+            "transport_failures": 0,
+            "generation_coverage": 1.0,
+            "low_confidence_ok": true,
+            "tg5_violations": []
+          },
+          {
+            "round": 1,
+            "rows": [
+              {
+                "method": "POST",
+                "path": "/accounts",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 3,
+                "covered": 3,
+                "requested": 3,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/devices",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 2,
+                "covered": 2,
+                "requested": 2,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/health",
+                "llm_called": false,
+                "first_pass": true,
+                "case_count": 1,
+                "covered": 1,
+                "requested": 1,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": true,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/invoices/{invoice_id}",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/items/{item_id}",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 2,
+                "covered": 2,
+                "requested": 2,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/orders",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/products",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 10,
+                "covered": 10,
+                "requested": 10,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/profiles",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/reports/summary",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 1,
+                "covered": 1,
+                "requested": 1,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/users",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              }
+            ],
+            "first_pass_rate": 1.0,
+            "transport_failures": 0,
+            "generation_coverage": 1.0,
+            "low_confidence_ok": true,
+            "tg5_violations": []
+          },
+          {
+            "round": 2,
+            "rows": [
+              {
+                "method": "POST",
+                "path": "/accounts",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 3,
+                "covered": 3,
+                "requested": 3,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/devices",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 2,
+                "covered": 2,
+                "requested": 2,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/health",
+                "llm_called": false,
+                "first_pass": true,
+                "case_count": 1,
+                "covered": 1,
+                "requested": 1,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": true,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/invoices/{invoice_id}",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/items/{item_id}",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 2,
+                "covered": 2,
+                "requested": 2,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/orders",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/products",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 10,
+                "covered": 10,
+                "requested": 10,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/profiles",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "GET",
+                "path": "/reports/summary",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 1,
+                "covered": 1,
+                "requested": 1,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              },
+              {
+                "method": "POST",
+                "path": "/users",
+                "llm_called": true,
+                "first_pass": true,
+                "case_count": 5,
+                "covered": 5,
+                "requested": 5,
+                "missing_dimensions": [],
+                "low_confidence_ok": true,
+                "error": null,
+                "error_kind": null,
+                "pure_rule_expected": false,
+                "coverage": 1.0
+              }
+            ],
+            "first_pass_rate": 1.0,
+            "transport_failures": 0,
+            "generation_coverage": 1.0,
+            "low_confidence_ok": true,
+            "tg5_violations": []
+          }
+        ],
+        "first_pass": {
+          "mean": 1.0,
+          "min": 1.0,
+          "max": 1.0
+        },
+        "generation_coverage": {
+          "mean": 1.0,
+          "min": 1.0,
+          "max": 1.0
+        },
+        "llm_calls": 27,
+        "prompt_tokens": 26358,
+        "completion_tokens": 24548,
+        "cached_tokens": 3584,
+        "cache_hit_rate": 0.13597389786782002,
+        "cost_cny": "0.024335",
+        "p95_latency_ms": 20446
+      }
+    }
+  ]
+}

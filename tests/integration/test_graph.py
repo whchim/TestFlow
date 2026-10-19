@@ -100,9 +100,100 @@ def _fresh_graph(redis_client, dispatched):
     return build_graph(RedisCheckpointSaver(redis_client), _deps(dispatched))
 
 
+def _set_review(session, run_id, status: str) -> int:
+    """模拟决策接口：把某 Run 下**全部**用例写成指定审核状态。"""
+    from testflow.storage.repositories import cases as cases_repo
+
+    cases = cases_repo.list_by_run(session, run_id)
+    return cases_repo.set_review_status(session, [c.id for c in cases], status)
+
+
+class TestCollectResultsDenominator:
+    """N5 的完成判定**分母是"应当有结果"的用例数**，不是"生成了多少条"。
+
+    对应决策：`06` §6.2（完成判定）、DM5（以 `count(*)` 为准）、
+    `06` §5.1（IP-1 决策）、TE3（破坏性用例不执行）。
+
+    ## 这个分母错了会怎样
+
+    被拒绝（或破坏性）的用例**永远不会有结果**，因为 N4 从不投递它们。
+    用生成条数当分母，`settled < expected` 就**永远成立**——于是每一次
+    运行都会记下一条 `partial_results` 失败，并去补记缺失的那些为 timeout。
+
+    ## 为什么它极容易漏掉
+
+    Run 的最终结论仍然是 `done`、通过率仍然正确、报告看起来完全正常。
+    错的只是 `node_failures` 里多出一条记录（进日志，不进报告），
+    以及——在 M2 修 `mark_unfinished_as_timeout` 之前——一条**假的
+    `timeout` 结果**，把"用户主动跳过"写成"目标接口超时"。
+
+    换句话说：它唯一的症状是**日志里的一句告警**，而那句话读起来
+    还挺像回事（"期望 3 条，已有 2 条"）。
+    """
+
+    async def test_rejected_cases_do_not_count_as_missing_results(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        """★ 3 条用例、1 条被拒绝、2 条有结果 → **不算部分失败**。"""
+        from testflow.graph import nodes as N
+
+        spec = make_spec()
+        op = make_operation(spec)
+        run = make_run(spec)
+        approved = [make_case(run, op, name=f"c{i}", review_status="approved") for i in range(2)]
+        make_case(run, op, name="被拒绝的", review_status="rejected")
+        session.flush()
+
+        results_repo.upsert_many(
+            session,
+            [{"run_id": run.id, "case_id": c.id, "status": "passed"} for c in approved],
+        )
+        session.flush()
+
+        out = await N.collect_results({"run_id": str(run.id)}, session=session)
+
+        failures = out.get("node_failures", [])
+        assert not [f for f in failures if f.kind == "partial_results"], (
+            "被拒绝的用例不该被算进分母——它按定义就没有结果"
+        )
+        assert out["settled_case_count"] == 2
+
+    async def test_a_genuinely_missing_result_is_still_flagged(
+        self, session, make_spec, make_operation, make_run, make_case
+    ) -> None:
+        """反向：**该有结果而没有**的，仍然要被标为部分失败。
+
+        少了这一条，上面那条可以通过"永远不报 partial_results"来满足——
+        而那会让"回调全丢了"这个真实问题也失去告警。
+        """
+        from testflow.graph import nodes as N
+
+        spec = make_spec()
+        op = make_operation(spec)
+        run = make_run(spec)
+        cases = [make_case(run, op, name=f"c{i}", review_status="approved") for i in range(2)]
+        session.flush()
+
+        # 只给一条结果，另一条真的丢了
+        results_repo.upsert_many(
+            session, [{"run_id": run.id, "case_id": cases[0].id, "status": "passed"}]
+        )
+        session.flush()
+
+        out = await N.collect_results({"run_id": str(run.id)}, session=session)
+
+        assert [f for f in out.get("node_failures", []) if f.kind == "partial_results"], (
+            "该有结果而没有的用例必须被报出来，否则「回调全丢了」会静默"
+        )
+        # 补记的那条必须是 timeout（`06` §6.4：系统不能无限等下去）
+        assert results_repo.get(session, run.id, cases[1].id).status == "timeout"
+
+
 class TestFullChain:
-    async def test_run_advances_to_the_interrupt(self, session, run_fixture, redis_client) -> None:
-        """推进一次应当跑到 IP-2 挂起，而不是跑完。"""
+    async def test_run_advances_to_the_review_gate(
+        self, session, run_fixture, redis_client
+    ) -> None:
+        """推进一次应当停在 IP-1（人工确认门），而不是直接执行。"""
         run, operations = run_fixture
         dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
         graph = _fresh_graph(redis_client, dispatched)
@@ -112,13 +203,13 @@ class TestFullChain:
         assert result == "started"
         session.expire_all()
         reloaded = runs_repo.get(session, run.id)
-        assert reloaded.phase == RunPhase.AWAITING_RESULTS, f"应当挂在 IP-2，实际 {reloaded.phase}"
-        assert dispatched, "已批准的用例应当被投递"
+        assert reloaded.phase == RunPhase.AWAITING_REVIEW, f"应当挂在 IP-1，实际 {reloaded.phase}"
+        assert dispatched == [], "人工确认之前不该投递任何用例"
 
-    async def test_cases_are_generated_and_approved(
+    async def test_cases_are_generated_pending_review(
         self, session, run_fixture, redis_client
     ) -> None:
-        """N2 生成了用例，N3 把它们全部批准（M1 无 IP-1）。"""
+        """N2 生成了用例，IP-1 让它们停在 `pending`，等人工确认。"""
         run, operations = run_fixture
         graph = _fresh_graph(redis_client, [])
 
@@ -128,7 +219,39 @@ class TestFullChain:
 
         cases = cases_repo.list_by_run(session, run.id)
         assert len(cases) == len(operations), "每个接口应当至少产出一条用例"
-        assert all(c.review_status == "approved" for c in cases)
+        assert all(c.review_status == "pending" for c in cases)
+
+    async def test_reject_all_then_resume_ends_the_run(
+        self, session, run_fixture, redis_client
+    ) -> None:
+        """全拒是正常结束（DONE），不是失败（`06` §4 明确 `END(DONE)`）。
+
+        `after_decisions` 是全系统唯一能表达"用户全否"的路径：一份"用户看过
+        之后决定不测"的报告，和一份"平台没跑成"的报告，含义完全不同。
+        """
+        run, _ = run_fixture
+        dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+        await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, dispatched),
+            redis=redis_client,
+            session=session,
+        )
+        _set_review(session, run.id, "rejected")
+
+        result = await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, dispatched),
+            redis=redis_client,
+            session=session,
+            reason="decisions_submitted",
+        )
+
+        assert result == "resumed"
+        assert dispatched == [], "全拒后不该投递任何用例"
+        session.expire_all()
+        assert runs_repo.get(session, run.id).phase == RunPhase.DONE
 
     async def test_resume_after_results_completes_the_run(
         self, session, run_fixture, redis_client
@@ -142,12 +265,20 @@ class TestFullChain:
         run, operations = run_fixture
         dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
 
-        # ── 第一个"进程"：跑到 IP-2
+        # ── 第一个"进程"：跑到 IP-1，批准全部，再推进到 IP-2
         await advance(
             run.id,
             graph=_fresh_graph(redis_client, dispatched),
             redis=redis_client,
             session=session,
+        )
+        _set_review(session, run.id, "approved")
+        await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, dispatched),
+            redis=redis_client,
+            session=session,
+            reason="decisions_submitted",
         )
 
         # ── 模拟 Worker 写结果（真实链路里这件事发生在别的进程、别的连接上）
@@ -191,6 +322,14 @@ class TestFullChain:
             redis=redis_client,
             session=session,
         )
+        _set_review(session, run.id, "approved")
+        await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, dispatched),
+            redis=redis_client,
+            session=session,
+            reason="decisions_submitted",
+        )
         for _, case_id in dispatched:
             results_repo.upsert_many(
                 session,
@@ -202,6 +341,7 @@ class TestFullChain:
             graph=_fresh_graph(redis_client, dispatched),
             redis=redis_client,
             session=session,
+            reason="results_ready",
         )
 
         from testflow.storage.repositories import reports as reports_repo
@@ -282,6 +422,14 @@ class TestIdempotencyAndGuards:
             graph=_fresh_graph(redis_client, dispatched),
             redis=redis_client,
             session=session,
+        )
+        _set_review(session, run.id, "approved")
+        await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, dispatched),
+            redis=redis_client,
+            session=session,
+            reason="decisions_submitted",
         )
 
         from testflow.storage.repositories import cases as cases_repo
@@ -366,7 +514,7 @@ class TestDispatchIdempotency:
             "target_operation_ids": [],
             "case_ids": [str(c.id) for c in approved],
             "approved_case_ids": [str(c.id) for c in approved],
-            "expected_case_count": len(approved),
+            "generated_case_count": len(approved),
             "settled_case_count": 0,
             "node_failures": [],
             "retry_counts": {},
@@ -391,6 +539,14 @@ class TestDispatchIdempotency:
             graph=_fresh_graph(redis_client, first),
             redis=redis_client,
             session=session,
+        )
+        _set_review(session, run.id, "approved")
+        await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, first),
+            redis=redis_client,
+            session=session,
+            reason="decisions_submitted",
         )
         assert len(first) >= 2, "前置条件：至少投递两条用例"
 
@@ -436,12 +592,20 @@ class TestFallbackPoll:
         run, _ = run_fixture
         dispatched: list[tuple[uuid.UUID, uuid.UUID]] = []
 
-        # ── 推进到 IP-2，然后把回调"丢掉"（不写结果、不唤醒）
+        # ── 推进到 IP-2（经过 IP-1 批准），然后把回调"丢掉"（不写结果、不唤醒）
         await advance(
             run.id,
             graph=_fresh_graph(redis_client, dispatched),
             redis=redis_client,
             session=session,
+        )
+        _set_review(session, run.id, "approved")
+        await advance(
+            run.id,
+            graph=_fresh_graph(redis_client, dispatched),
+            redis=redis_client,
+            session=session,
+            reason="decisions_submitted",
         )
         session.expire_all()
         assert runs_repo.get(session, run.id).phase == RunPhase.AWAITING_RESULTS
@@ -498,6 +662,55 @@ class TestFallbackPoll:
             )
             == []
         ), "刚更新过的 Run 不该被判为停滞"
+
+
+class TestAbandonStaleReviews:
+    """审阅超时（`06` §5.1）：`awaiting_review` 挂太久 → `abandoned`。
+
+    与 `fallback_poll` 的区别：那个是**推进**（救回卡住的 Run），
+    这个是**放弃**（了结没人管的 Run）。放弃是终态，没有下一步可走。
+    """
+
+    async def test_stale_review_is_abandoned(
+        self, session, make_spec, make_run, monkeypatch
+    ) -> None:
+        from sqlalchemy import text
+
+        from testflow.graph import tasks_beat
+
+        run = make_run(make_spec(), phase=RunPhase.AWAITING_REVIEW)
+        # 制造"审阅超时"：把时间戳拨回 8 天前（默认阈值为 7 天）。
+        session.execute(
+            text("update runs set updated_at = now() - interval '8 days' where id = :i"),
+            {"i": run.id},
+        )
+        session.flush()
+
+        # 任务会在结束前 `close()` 它拿到的 session。给它一份**独立**的 session
+        # （绑定到同一个连接/事务），验证用原来的 session——否则 close 会把
+        # 我们要读的状态一起关了。
+        task_session = Session(bind=session.get_bind(), join_transaction_mode="create_savepoint")
+        monkeypatch.setattr(tasks_beat, "_get_context", lambda: _Ctx(task_session))
+
+        result = tasks_beat.abandon_stale_reviews()
+
+        assert result["abandoned"] == 1
+        session.expire_all()
+        reloaded = runs_repo.get(session, run.id)
+        assert reloaded.phase == RunPhase.ABANDONED
+        assert reloaded.failure_reason == "review_timeout"
+
+    async def test_fresh_review_is_not_abandoned(
+        self, session, make_spec, make_run, monkeypatch
+    ) -> None:
+        from testflow.graph import tasks_beat
+
+        make_run(make_spec(), phase=RunPhase.AWAITING_REVIEW)
+
+        monkeypatch.setattr(tasks_beat, "_get_context", lambda: _Ctx(session))
+        result = tasks_beat.abandon_stale_reviews()
+
+        assert result["abandoned"] == 0, "刚挂起的 Run 不该被判为审阅超时"
 
 
 class _Ctx:
@@ -600,7 +813,8 @@ class TestDataIsCommittedBeforeDispatch:
                     generator=RuleBasedGenerator(),
                     fallback_rule_generator=RuleBasedGenerator(),
                 )
-                cases_repo.approve_all_pending(work, run_id)
+                pending = cases_repo.list_by_run(work, run_id, review_status="pending")
+                cases_repo.set_review_status(work, [c.id for c in pending], "approved")
                 approved = cases_repo.list_by_run(work, run_id, review_status="approved")
                 assert approved, "前置条件：应当生成并批准了用例"
                 approved_ids = [str(c.id) for c in approved]
@@ -618,7 +832,7 @@ class TestDataIsCommittedBeforeDispatch:
                         "target_operation_ids": [],
                         "case_ids": approved_ids,
                         "approved_case_ids": approved_ids,
-                        "expected_case_count": len(approved_ids),
+                        "generated_case_count": len(approved_ids),
                         "settled_case_count": 0,
                         "node_failures": [],
                         "retry_counts": {},

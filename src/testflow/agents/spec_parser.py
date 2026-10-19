@@ -313,12 +313,13 @@ def _expand(
     document: dict[str, Any],
     depth: int,
     budget: _ExpandBudget,
-) -> tuple[Any, bool]:
+) -> Any:
     """递归展开 `$ref`。
 
-    Returns:
-        `(展开后的结构, 是否有未展开的 $ref)`。第二个值一路上浮，
-        最终落到 `operations.has_unresolved_ref`。
+    凡是没有展开的引用，**原样保留**——判断"这个接口的 schema 是否完整"由
+    `_contains_ref` 在展开之后扫描子树得出，而不是在递归里一路往上传一个布尔值。
+    往上传的做法只能得到"整份文档有没有未展开的引用"，而那正是 `04` §2.2
+    反对的口径。
 
     Note:
         预算耗尽后**立刻停止递归**，但外层循环仍要继续（否则返回的结构会缺键）。
@@ -327,7 +328,7 @@ def _expand(
         只是每次都立刻返回。**那依然是 100 亿次函数调用。**
     """
     if budget.exceeded:
-        return node, True
+        return node
 
     if isinstance(node, dict):
         ref = node.get("$ref")
@@ -335,60 +336,60 @@ def _expand(
             if depth >= _MAX_REF_DEPTH:
                 # **SP1：超限保留字面量。** 保留而不是删掉——下游至少能看到
                 # "这里本来有个 $ref"，而删除会让缺失变得不可见。
-                return node, True
+                return node
             budget.expansions += 1
             if budget.expansions > _MAX_REF_EXPANSIONS:
                 budget.exceeded = True
-                return node, True
+                return node
 
             target = _resolve_pointer(document, ref)
-            expanded, unresolved = _expand(target, document, depth + 1, budget)
+            expanded = _expand(target, document, depth + 1, budget)
             # 兄弟键在 OpenAPI 3.1 里合法（用于附加描述）；3.0 忽略它们。
             # 这里保留 `$ref` 之外的兄弟键，避免丢信息。
             siblings = {k: v for k, v in node.items() if k != "$ref"}
             if siblings and isinstance(expanded, dict):
-                merged, more = _expand(siblings, document, depth, budget)
-                return {**expanded, **merged}, unresolved or more
-            return expanded, unresolved
+                merged = _expand(siblings, document, depth, budget)
+                return {**expanded, **merged}
+            return expanded
 
         resolved: dict[str, Any] = {}
-        unresolved_any = False
         for key, value in node.items():
             if budget.exceeded:
                 resolved[key] = value  # 预算已耗尽，原样保留，不再深入
                 continue
-            new_value, unresolved = _expand(value, document, depth, budget)
-            resolved[key] = new_value
-            unresolved_any = unresolved_any or unresolved
-        return resolved, unresolved_any
+            resolved[key] = _expand(value, document, depth, budget)
+        return resolved
 
     if isinstance(node, list):
         items = []
-        unresolved_any = False
         for item in node:
             if budget.exceeded:
                 items.append(item)
                 continue
-            new_item, unresolved = _expand(item, document, depth, budget)
-            items.append(new_item)
-            unresolved_any = unresolved_any or unresolved
-        return items, unresolved_any
+            items.append(_expand(item, document, depth, budget))
+        return items
 
-    return node, False
+    return node
 
 
-def expand_refs(document: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """展开全部 `$ref`，并报告是否留有未展开的。
+def expand_refs(document: dict[str, Any]) -> dict[str, Any]:
+    """展开全部 `$ref`，返回自包含的文档。
 
     **展开发生在解析期而非消费期**：`TestCaseGen` 需要自包含的 schema 片段。
     若留着 `$ref`，要么每个消费者各自实现一遍解析器（必然漂移），
     要么把整份文档塞进提示词（触发 Qwen 阶梯计费跳档，成本 ×5）。
+
+    Note:
+        **这里刻意不返回"整份文档是否有未展开的 `$ref`"。** 那个值曾经被原样
+        盖给每个接口，导致一个接口引用了递归结构、其余接口全部被标成信息不完整
+        （`04` §2.2 明确要求逐接口标记）。判断改在 `extract_operations` 里
+        按接口子树做——见 `_contains_ref`。
     """
     budget = _ExpandBudget()
-    expanded, unresolved = _expand(document, document, 0, budget)
+    expanded = _expand(document, document, 0, budget)
     if not isinstance(expanded, dict):  # pragma: no cover —— 根节点已在 ① 校验
         raise SpecParseError("not_an_object", "展开后的根节点不是对象")
-    return expanded, unresolved
+    return expanded
 
 
 # ══════════════════════════════════════════════════════ ④⑤ 规范化与指纹
@@ -506,14 +507,34 @@ def _op_is_destructive(method: str, operation: dict[str, Any]) -> bool:
     return method.upper() in DESTRUCTIVE_METHODS
 
 
-def extract_operations(
-    document: dict[str, Any], *, has_unresolved_ref: bool
-) -> list[ParsedOperation]:
+def _contains_ref(node: Any) -> bool:
+    """子树里是否还残留 `$ref` 字面量。
+
+    展开预算只保证"不会无限展开"，不保证"所有 `$ref` 都被解掉"——递归结构与
+    预算耗尽都会留下字面量。留下就说明**这个接口的 schema 是不完整的**。
+
+    逐接口判断而非整份文档判断，理由见 `04` §2.2：一份 Spec 里通常只有一两个
+    接口引用了超深的递归结构，把整份文档标成"信息不全"会让其余接口生成的用例
+    陪绑降级——而低置信度用例在归因阶段会被降级（`LogAnalyzer` LA3）。
+    """
+    if isinstance(node, dict):
+        if isinstance(node.get("$ref"), str):
+            return True
+        return any(_contains_ref(value) for value in node.values())
+    if isinstance(node, list):
+        return any(_contains_ref(item) for item in node)
+    return False
+
+
+def extract_operations(document: dict[str, Any]) -> list[ParsedOperation]:
     """逐 `path` × `method` 提取接口。
 
     `parameters_schema` 等三块**整块存 JSONB**，不按 parameter 拆行（`04` §2.10）：
     schema 是整体（`$ref`、嵌套、条件约束），拆行会破坏结构完整性。裁剪在组装
     提示词时进行——那是 Qwen 阶梯计费（`02` §5.1）的要求。
+
+    `has_unresolved_ref` **逐接口计算**（`04` §2.2 / `03/SpecParser.md` SP1）：
+    路径级 `parameters` 与操作自身的 `requestBody` / `responses` 都要看。
     """
     operations: list[ParsedOperation] = []
 
@@ -537,7 +558,8 @@ def extract_operations(
                     parameters_schema={"parameters": merged_params} if merged_params else None,
                     request_body_schema=operation.get("requestBody"),
                     responses_schema=operation.get("responses"),
-                    has_unresolved_ref=has_unresolved_ref,
+                    # 路径级 parameters 不在 `operation` 里，必须单独看。
+                    has_unresolved_ref=_contains_ref(operation) or _contains_ref(path_params),
                     is_destructive=_op_is_destructive(method, operation),
                 )
             )
@@ -680,12 +702,12 @@ def parse_spec(content: str) -> ParsedSpec:
     # 先于校验器——见 `reject_external_refs` 的说明。
     reject_external_refs(document)
     version = validate_spec(document)
-    expanded, has_unresolved = expand_refs(document)
+    expanded = expand_refs(document)
     # 指纹算在**剔除已内联的 components 之后**的结构上——否则 `$ref` 写法与
     # 内联写法会得到不同的指纹，SP5 的目标就落空了。
     normalized = normalize(strip_expanded_components(expanded))
     fingerprint = fingerprint_of(normalized)
-    operations = extract_operations(expanded, has_unresolved_ref=has_unresolved)
+    operations = extract_operations(expanded)
     targets, warnings = extract_declared_targets(expanded)
 
     return ParsedSpec(

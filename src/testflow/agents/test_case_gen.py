@@ -38,14 +38,16 @@ import dataclasses
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from sqlalchemy.orm import Session
 
-from testflow.agents.dimensions import derive_dimensions, is_pure_rule_operation
+from testflow.agents.dimensions import derive_dimensions, is_pure_rule_operation, json_body_schema
+from testflow.agents.spec_context import SpecContext, build_spec_context
 from testflow.domain.assertions import StatusCodeAssertion
 from testflow.domain.cases import CaseCategory, DimensionSpec, GeneratedCase, GenerationResult
 from testflow.observability.logging import get_logger
+from testflow.observability.tracing import bind_llm_purpose, reset_llm_purpose
 from testflow.storage.models import Case, Operation
 from testflow.storage.repositories import cases as cases_repo
 from testflow.storage.repositories import run_operations as ro_repo
@@ -86,6 +88,8 @@ class CaseGenerator(Protocol):
         self,
         operation: Operation,
         dimensions: Sequence[DimensionSpec],
+        *,
+        spec_context: SpecContext | None = None,
     ) -> GenerationResult: ...
 
 
@@ -109,8 +113,15 @@ class RuleBasedGenerator:
         self._base_path = base_path
 
     async def generate(
-        self, operation: Operation, dimensions: Sequence[DimensionSpec]
+        self,
+        operation: Operation,
+        dimensions: Sequence[DimensionSpec],
+        *,
+        spec_context: SpecContext | None = None,
     ) -> GenerationResult:
+        # 规则生成器不用 Spec 全局信息：它只处理"无信息接口"，
+        # 那些接口没有鉴权也没有 4xx。参数保留是为了协议一致。
+        del spec_context
         cases: list[GeneratedCase] = []
         for spec in dimensions:
             if spec.dimension != "value_valid":
@@ -185,12 +196,40 @@ async def generate_for_operations(
         本次实际产出与失败的清单。**部分失败不阻塞全局**——
         一个接口的 schema 特别难处理，不该让整份 Spec 的生成全部作废。
     """
+    # 绑定调用用途：Provider 据此决定是否开思考模式（`02` §5.3）。
+    # 放在这里而不是每个调用点，是因为**所有**生成路径都必须带同一个用途。
+    token = bind_llm_purpose("case_generation")
+    try:
+        return await _generate_for_operations(
+            session,
+            run_id=run_id,
+            operation_ids=operation_ids,
+            generator=generator,
+            fallback_rule_generator=fallback_rule_generator,
+        )
+    finally:
+        reset_llm_purpose(token)
+
+
+async def _generate_for_operations(
+    session: Session,
+    *,
+    run_id: uuid.UUID,
+    operation_ids: Sequence[uuid.UUID],
+    generator: CaseGenerator,
+    fallback_rule_generator: CaseGenerator | None,
+) -> GenerateOutcome:
     statuses = ro_repo.status_of(session, run_id)
     generated: list[uuid.UUID] = []
     failed: list[uuid.UUID] = []
     skipped: list[uuid.UUID] = []
 
-    for operation in _load_operations(session, operation_ids):
+    operations = _load_operations(session, operation_ids)
+    # 同一份 Spec 的全局信息**只提取一次**：它逐字节相同，重复提取没有意义，
+    # 而"两次提取结果不同"会让缓存前缀在同一个 Run 内抖动。
+    spec_context = _load_spec_context(session, operations)
+
+    for operation in operations:
         # ★ DM4：**已成功的跳过。** 不是"重放"——LLM 输出非确定，
         # 重跑会得到不同的用例，并静默替换用户已确认过的那些。
         if statuses.get(operation.id) == "succeeded":
@@ -214,7 +253,7 @@ async def generate_for_operations(
             active = generator
 
         try:
-            result = await active.generate(operation, dimensions)
+            result = await active.generate(operation, dimensions, spec_context=spec_context)
         except Exception as exc:  # noqa: BLE001 —— 单个接口失败不该带崩整批
             logger.warning("用例生成失败 operation=%s：%s", operation.id, exc)
             ro_repo.mark_failed(session, run_id, operation.id, error=str(exc)[:500])
@@ -233,10 +272,152 @@ async def generate_for_operations(
     )
 
 
+def _load_spec_context(session: Session, operations: Sequence[Operation]) -> SpecContext | None:
+    """取这批接口所属 Spec 的半稳定上下文。
+
+    一批里混了多个 `spec_id` 时返回 `None`：那说明调用方把不该放一起的接口
+    放一起了。此时**宁可不给上下文**，也不要把 A 的鉴权方式用在 B 的接口上。
+    """
+    from testflow.storage.repositories import specs as specs_repo
+
+    spec_ids = {operation.spec_id for operation in operations}
+    if len(spec_ids) != 1:
+        return None
+    spec = specs_repo.get(session, next(iter(spec_ids)))
+    if spec is None:  # pragma: no cover —— 外键保证不会发生
+        return None
+    return build_spec_context(spec.raw_content)
+
+
 def _load_operations(session: Session, operation_ids: Sequence[uuid.UUID]) -> list[Operation]:
     from testflow.storage.repositories import operations as operations_repo
 
     return operations_repo.list_by_ids(session, operation_ids)
+
+
+#: JSON Schema / OpenAPI 里**语义有标准定义**的 `format`。
+#:
+#: 不在这份集合里的（例如 `imei`、`uuid-v7`、`CN-PHONE`）是业务自定义格式：
+#: 阶段 A 仍然派 `constraint_violation` 维度（"应当拒绝不符合格式的值"是
+#: 确定的），但**具体什么值算不符合**只能由模型猜——所以该用例标低置信度
+#: （`TestCaseGen.md` §7 触发 ④）。这是 Golden Set 第 10 号接口检验的降级行为。
+_STANDARD_FORMATS: frozenset[str] = frozenset(
+    {
+        "date-time",
+        "date",
+        "time",
+        "duration",
+        "email",
+        "idn-email",
+        "hostname",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "uri",
+        "uri-reference",
+        "iri",
+        "iri-reference",
+        "uuid",
+        "uri-template",
+        "json-pointer",
+        "relative-json-pointer",
+        "regex",
+        "password",
+        "byte",
+        "binary",
+        "int32",
+        "int64",
+        "float",
+        "double",
+        "decimal",
+    }
+)
+
+
+def _classify_confidence(operation: Operation, case: GeneratedCase) -> Literal["high", "low"]:
+    """§7 低置信度：由具体原因构成，任一触发 → `low`，否则 `high`。
+
+    §7 的六触发里，当前实现可观测五条：
+
+    * ① `responses_schema` 未声明该状态码 → 断言 `derived_from == "inferred"`（期望靠推断）
+    * ④ 字段使用自定义 `format` → 该字段的 `constraint_violation` 用例
+    * ⑤ 响应体无 schema → 内容断言缺失、仅剩状态码
+    * ⑥ 维度标记 `inferred` → 该用例本身
+    * `has_unresolved_ref`（比 §7 更强：`$ref` 展开超限，schema 信息整体不完整）
+
+    ②③（字段无 example / 无 min-max-长度）暂不触发：`value_valid` 本身
+    不携带字段级信息，要判断"合法值靠猜"需要阶段 B 的产物逐字段分析，
+    当前没有可靠的落点。**不在这里留一个永远走不到的分支。**
+    """
+    if operation.has_unresolved_ref:
+        return "low"
+    if case.derived_from == "inferred":
+        return "low"
+    if any(a.derived_from == "inferred" for a in case.assertions):
+        return "low"
+    if _uses_custom_format(operation, case.dimension):
+        return "low"
+    if _has_no_content_assertion(case) and not _has_response_body_schema(
+        operation.responses_schema
+    ):
+        return "low"
+    return "high"
+
+
+def _uses_custom_format(operation: Operation, dimension: str) -> bool:
+    """`constraint_violation:<field>` 的字段是否用了非标准 `format`。
+
+    只认请求体顶层字段：阶段 A 目前只从顶层 `properties` 派生约束维度，
+    去嵌套结构里找一个没被派生过的字段名只会制造误判。
+    """
+    prefix = "constraint_violation:"
+    if not dimension.startswith(prefix):
+        return False
+    field = dimension[len(prefix) :]
+    schema = json_body_schema(operation.request_body_schema) or {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    field_schema = properties.get(field)
+    if not isinstance(field_schema, dict):
+        return False
+    fmt = field_schema.get("format")
+    return isinstance(fmt, str) and fmt not in _STANDARD_FORMATS
+
+
+def _has_no_content_assertion(case: GeneratedCase) -> bool:
+    """用例是否**没有任何内容断言**（只剩状态码）——§7 触发 ⑤ 的前半。"""
+    return all(a.type == "status_code" for a in case.assertions)
+
+
+def _has_response_body_schema(responses_schema: dict | None) -> bool:
+    """`responses_schema` 里是否**任何**响应声明了 body schema。
+
+    没有 body schema 时，内容断言无从派生——这正是 §7 触发 ⑤ 的原因。
+    """
+    if not isinstance(responses_schema, dict):
+        return False
+    for response in responses_schema.values():
+        if not isinstance(response, dict):
+            continue
+        content = response.get("content")
+        if isinstance(content, dict) and any(
+            isinstance(media, dict) and "schema" in media for media in content.values()
+        ):
+            return True
+    return False
+
+
+def _resolve_confidence(operation: Operation, case: GeneratedCase) -> str:
+    """最终落库的置信度。保守合并：任一来源判 `low` 则 `low`（§7 聚合规则）。
+
+    生成方（LLM）可在 `case.confidence` 显式标 `low`；`_classify_confidence`
+    是确定性兜底与下限——两者任一判 `low` 就 `low`，绝不因生成方自报 `high`
+    而放行一条 schema 信息不完整的用例。
+    """
+    if case.confidence == "low" or _classify_confidence(operation, case) == "low":
+        return "low"
+    return "high"
 
 
 def _persist(
@@ -249,16 +430,12 @@ def _persist(
 ) -> list[uuid.UUID]:
     """落库，并把 `Operation` 上的属性**继承**到每条用例。
 
-    继承的两项各有理由：
-
-    * `is_destructive` —— 来自 `operations` 而不是 `cases` 的生成逻辑，
-      因为它是 Spec 的属性（可能由 `x-destructive` 显式声明），
-      不是生成方的判断。生成方"决定"它是否是破坏性的，是错的。
-    * `has_unresolved_ref` → `confidence = "low"` —— `$ref` 展开超限意味着
-      schema 信息不完整（`SpecParser` SP1），据此生成的用例期望值不可靠。
+    `is_destructive` 来自 `operations` 而不是生成逻辑，因为它是 Spec 的属性
+    （可能由 `x-destructive` 显式声明），不是生成方的判断。生成方"决定"它
+    是不是破坏性的，是错的。置信度则按 §7 逐条计算——它取决于每条用例自己的
+    断言与 `derived_from`，不再是"整个 Operation 一个值"。
     """
     generated_by = "rule" if isinstance(active, RuleBasedGenerator) else "llm"
-    confidence = "low" if operation.has_unresolved_ref else None
     llm_model = getattr(active, "model_name", None) if generated_by == "llm" else None
 
     rows = [
@@ -275,7 +452,7 @@ def _persist(
                     operation,
                     generated_by=generated_by,
                     llm_model=llm_model,
-                    confidence=confidence,
+                    confidence=_resolve_confidence(operation, case),
                 )
             ),
         )

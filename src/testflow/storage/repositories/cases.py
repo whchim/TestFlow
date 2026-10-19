@@ -2,10 +2,10 @@
 
 对应决策：`04-数据模型.md` §2.5、`06-Agent编排.md` §5.1（IP-1 决策落库）。
 
-**M1 没有 IP-1 人工确认门**，但 `review_status` 仍要被写成 `approved`——
-因为 N3 的路由依据是 `approved_case_ids` 是否为空（G4），而不是"有没有人审过"。
-M2 把门插进图之后，这里的 `approve_all_pending` 会换成"读人工决策"，
-而下游的路由逻辑一行都不用改。**这正是让状态字段先于功能存在的价值。**
+`review_status` 是 IP-1 的落点：批准 / 拒绝由决策接口写进这里，N3
+只**读**"已批准"的集合（`approved_case_ids`）。本模块提供批量写
+`set_review_status`，但**不提供"无条件全批"**——那是 M1 没有人工确认门
+时的临时做法，已随 M2 移除（路线图 Q1：临时即永久）。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, cast
 
+from sqlalchemy import case as sa_case
 from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.engine import CursorResult
@@ -22,13 +23,30 @@ from sqlalchemy.orm import Session
 from testflow.storage.models import Case
 
 __all__ = [
-    "approve_all_pending",
     "count_by_run",
+    "count_dispatchable",
     "get",
     "insert_many",
     "list_by_run",
+    "list_page",
     "set_review_status",
 ]
+
+#: 置信度的展示排序：**`low` 在前，`NULL` 居中，`high` 在后**。
+#:
+#: 这不是"排序好看"，而是把人工确认的注意力引到最该看的地方：
+#: 一条低置信度用例意味着它的期望值有一部分是**推断**出来的
+#: （`TestCaseGen` §7 的六触发），而"推断"正是会出现"期望值本身写错了"
+#: 的那个类别。高置信度的那批看着顺眼，不需要人逐条读。
+#:
+#: `NULL` 排在中间，是因为它的含义是"不确定"——M1 生成的用例没有这个字段
+#: （那时还没有置信度标注），把历史数据当成"高置信"是错的，
+#: 当成"低置信"又会把一整批老用例灌进待细看的那一堆。
+_CONFIDENCE_RANK = sa_case(
+    (Case.confidence == "low", 0),
+    (Case.confidence.is_(None), 1),
+    else_=2,
+)
 
 
 def insert_many(session: Session, cases: Sequence[Case]) -> int:
@@ -56,8 +74,70 @@ def list_by_run(
     return list(session.scalars(stmt.order_by(Case.created_at, Case.name)))
 
 
-def count_by_run(session: Session, run_id: uuid.UUID) -> int:
-    return session.scalar(select(func.count()).select_from(Case).where(Case.run_id == run_id)) or 0
+def list_page(session: Session, run_id: uuid.UUID, *, limit: int, offset: int) -> list[Case]:
+    """按置信度排序分页取用例。**人工确认界面用这个。**
+
+    排序与 `list_by_run` 不同，这是刻意的：那个服务于内部遍历
+    （报告、投递），要的是"稳定顺序"，所以按 `created_at`；
+    这个服务于**人看**，要的是"最该被检查的排在前面"。
+
+    两个排序共用一个函数、用一个参数切换，会让两边的意图都变模糊
+    ——所以它们是两个函数。
+    """
+    stmt = (
+        select(Case)
+        .where(Case.run_id == run_id)
+        # 第二、三个排序键保证**分页稳定**：置信度相同的用例之间必须有确定
+        # 顺序，否则翻页时同一条用例可能出现在两页里、也可能一条都不出现。
+        # 这类 bug 只在数据量超过一页时出现，而那时已经很难联想到排序。
+        .order_by(_CONFIDENCE_RANK, Case.created_at, Case.name)
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(session.scalars(stmt))
+
+
+def count_by_run(session: Session, run_id: uuid.UUID, *, review_status: str | None = None) -> int:
+    """某 Run 的用例数。可按审核状态过滤（生成采纳率要 `approved`）。"""
+    stmt = select(func.count()).select_from(Case).where(Case.run_id == run_id)
+    if review_status is not None:
+        stmt = stmt.where(Case.review_status == review_status)
+    return session.scalar(stmt) or 0
+
+
+def count_dispatchable(session: Session, run_id: uuid.UUID) -> int:
+    """**应当有结果**的用例数——也就是 N4 真正会投递的那些。
+
+    口径与 `dispatch_cases` **逐条对齐**，两边必须同时改：
+
+        review_status == 'approved'   仅已批准的会进 approved_case_ids
+        is_destructive is False       TE3 主动跳过，永不投递
+
+    ## 为什么需要它，以及为什么不能用 `count_by_run`
+
+    完成判定问的是"**该回来的结果都回来了吗**"（`gateway/internal.py`）。
+    用全部用例数当分母的话，一个被拒绝的用例会让 `settled` 永远追不上
+    `expected`——于是"所有结果到齐了"这个条件**永远不会成立**，
+    回调唤醒全部变成空转，Run 只能等兜底轮询。
+
+    而那个 bug 的表现是**慢**，不是错：Run 最终仍然会完成，只是每次都
+    白等一个轮询周期。没有人会为一个"有点慢"的功能开一张工单。
+
+    这个数与 `count_results` 配合，构成 DM5 要求的"以 `SELECT count(*)`
+    为准"的完成判定——两个数都来自权威表，不读任何派生缓存。
+    """
+    return (
+        session.scalar(
+            select(func.count())
+            .select_from(Case)
+            .where(
+                Case.run_id == run_id,
+                Case.review_status == "approved",
+                Case.is_destructive.is_(False),
+            )
+        )
+        or 0
+    )
 
 
 def set_review_status(session: Session, case_ids: Sequence[uuid.UUID], status: str) -> int:
@@ -83,24 +163,3 @@ def set_review_status(session: Session, case_ids: Sequence[uuid.UUID], status: s
         ),
     )
     return result.rowcount or 0
-
-
-def approve_all_pending(session: Session, run_id: uuid.UUID) -> int:
-    """把某 Run 下全部待审用例标为已批准。返回条数。
-
-    **这是 M1 绕过 IP-1 的方式**——不是"加了一个可以打开的自动批准开关"，
-    而是"这个门此刻还不存在"。路线图 Q1 警告过前者的风险：
-    可关闭的安全开关会被误设、被复制到生产、被"临时"关掉后遗忘。
-    一个根本不存在的东西，没有会被忘记关掉的问题。
-
-    M2 把 IP-1 插入图之后，本函数被 `apply_decisions` 的"读人工决策"取代。
-    """
-    return set_review_status(
-        session,
-        list(
-            session.scalars(
-                select(Case.id).where(Case.run_id == run_id, Case.review_status == "pending")
-            )
-        ),
-        "approved",
-    )

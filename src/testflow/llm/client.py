@@ -30,13 +30,58 @@
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
 from pydantic import BaseModel
 
-__all__ = ["LLMClient", "LLMError", "ModelT"]
+__all__ = [
+    "LLMClient",
+    "LLMContentError",
+    "LLMError",
+    "ModelT",
+    "UsageRecord",
+    "UsageSink",
+]
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+@dataclass(frozen=True, slots=True)
+class UsageRecord:
+    """一次模型调用的用量。**与厂商无关**，只含我们能用来算成本的事实。
+
+    ## 为什么它是"记录"而不是 `generate` 的返回值
+
+    `LLMClient.generate` 的契约是"提示词进、结构化对象出"（极窄）。把用量
+    塞进返回值会逼所有调用方改签名，而其中大多数并不关心 token。
+    改成构造器回调（`QwenProvider(on_usage=...)`）之后，协议一行不动，
+    采集是**旁路**的。
+
+    ## 为什么要记录"计费了但输出不合法"的调用
+
+    模型返回 200 就已经计费了，即使解析失败。只在成功路径记录，
+    成本会系统性偏低——而那种偏差不会报错，只会让"实际花了多少"
+    永远比账单小一点。
+    """
+
+    run_id: uuid.UUID | None
+    trace_id: str | None
+    purpose: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    total_tokens: int
+    attempt: int
+    elapsed_ms: int
+
+
+UsageSink = Callable[[UsageRecord], None]
+"""用量落点。**实现方自己负责容错**——指标写入失败不能影响一次已付费的调用。"""
 
 
 class LLMError(Exception):
@@ -46,6 +91,16 @@ class LLMError(Exception):
     和 A2~A4 那些约束拦（生成期），而这里是"根本没拿到可用的输出"。
     两者在上层都会导致 `run_operations.gen_status = 'failed'`，
     但归因与重试策略不同。
+    """
+
+
+class LLMContentError(LLMError):
+    """**已计费**、但输出无法使用（解析失败 / 类型不符 / 内容不合契约）。
+
+    为什么要和 `LLMError` 分开：生成器要对"内容不合格"做**带反馈的重试**
+    （把哪里不对告诉模型，再要一次）；而传输失败已经在 Provider 内部重试过，
+    超时更是刻意不重试（重试会让耗时可乘）。如果两者同一个类型，
+    生成器就只能二选一：要么漏掉内容重试，要么把超时也再重试一遍。
     """
 
 

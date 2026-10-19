@@ -41,9 +41,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from testflow.agents.spec_context import SpecContext
+from testflow.domain.attribution import FailureContext
 from testflow.domain.cases import DimensionSpec, GenerationResult
 
-__all__ = ["SYSTEM_PREFIX", "build_generation_prompt"]
+__all__ = [
+    "ATTRIBUTION_SYSTEM_PREFIX",
+    "SYSTEM_PREFIX",
+    "build_attribution_prompt",
+    "build_generation_prompt",
+]
 
 #: **稳定前缀**——整个 Run 内逐字节不变。任何会变的东西都不能放进来。
 #:
@@ -61,6 +68,10 @@ SYSTEM_PREFIX = """你是 API 测试用例生成助手。你的任务：给定�
 4. **不要把任何凭证放进请求头或请求体**。凭证由平台在执行时按主机注入。
 5. 取值必须**合法且有区分度**：`value_valid` 维度给一组能通过校验的输入；\
 边界维度给刚好在边界上的值。
+6. 维度名形如 `status:409` 表示"期望返回该状态码"——对应用例必须断言它。
+7. 接口 `responses` 里声明的**每个 4xx 状态码**至少要有 1 条用例断言它。\
+若清单里没有对应维度，可以补充维度，但必须把该用例标为 `inferred`，\
+且额外维度**不得超过给定维度的一半**。
 
 ## 断言类型
 
@@ -86,6 +97,8 @@ def build_generation_prompt(
     *,
     operation: dict[str, Any],
     dimensions: list[DimensionSpec],
+    spec_context: SpecContext | None = None,
+    feedback: str | None = None,
 ) -> str:
     """组装一次生成调用的提示词。
 
@@ -95,31 +108,40 @@ def build_generation_prompt(
             超过 128K 单价跳 5 倍（`02` §5.1）。逐 Operation 天然把
             单次输入限制在几 KB。
         dimensions: 阶段 A 派生的维度清单。
+        spec_context: 同一 Spec 内不变的全局信息。为空时半稳定层为空串。
+        feedback: 上一次输出没通过 L1/L2 时的修正提示。**只追加在易变层末尾**——
+            放进稳定前缀会让缓存**每一次重试都失效**。
 
     Returns:
         完整的提示词。**顺序是固定的**：稳定前缀 → 半稳定 → 易变。
     """
     # 半稳定层：同一 Spec 内的所有 Operation 共享这一段的内容。
-    # 目前为空——M1 还没有"Spec 全局信息"（比如认证方案、通用错误约定）。
-    # 留着一个明确的位置，是为了让 M4 加缓存观测时知道该往哪儿放。
-    semi_stable = ""
+    # 它必须是逐字节确定的，否则前缀缓存静默失效（`07` §5.3）。
+    semi_stable = spec_context.prompt_block() if spec_context is not None else ""
 
     # 易变层。
-    volatile = "\n".join(
-        (
-            f"OPERATION: {operation.get('method', 'GET')} {operation.get('path', '/')}",
-            # 维度清单用**一行 JSON**：假 Provider 要能按固定规则取出来，
-            # 而真实模型读它也不困难。缩进对它没有帮助，反而让"一行一个标记"
-            # 这个约定变得模糊。
-            "DIMENSIONS: "
-            + json.dumps([d.model_dump(mode="json") for d in dimensions], ensure_ascii=False),
-            "",
-            "## 接口结构",
-            json.dumps(_trim(operation), ensure_ascii=False, indent=2, sort_keys=True),
-            "",
-            "请为上面 `DIMENSIONS` 里的每一个维度产出一条用例。",
+    volatile_parts = [
+        f"OPERATION: {operation.get('method', 'GET')} {operation.get('path', '/')}",
+        # 维度清单用**一行 JSON**：假 Provider 要能按固定规则取出来，
+        # 而真实模型读它也不困难。缩进对它没有帮助，反而让"一行一个标记"
+        # 这个约定变得模糊。
+        "DIMENSIONS: "
+        + json.dumps([d.model_dump(mode="json") for d in dimensions], ensure_ascii=False),
+        "",
+        "## 接口结构",
+        json.dumps(_trim(operation), ensure_ascii=False, indent=2, sort_keys=True),
+        "",
+        "请为上面 `DIMENSIONS` 里的每一个维度产出一条用例。",
+    ]
+    if feedback:
+        volatile_parts.extend(
+            (
+                "",
+                "## 上一次输出没有通过校验，请针对性修正",
+                feedback,
+            )
         )
-    )
+    volatile = "\n".join(volatile_parts)
 
     return f"{SYSTEM_PREFIX}\n{semi_stable}\n{volatile}"
 
@@ -138,6 +160,82 @@ def _trim(operation: dict[str, Any]) -> dict[str, Any]:
     """
     keep = ("method", "path", "parameters_schema", "request_body_schema", "responses_schema")
     return {key: operation[key] for key in keep if operation.get(key) is not None}
+
+
+# ══════════════════════════════════════════════ 归因（M3）
+
+#: 归因兜底的稳定前缀。
+#:
+#: 与生成提示词同理：整段逐字节不变，才能吃到上下文缓存（`02` §5.4）。
+#: **不包含**任何失败现场的信息——那些全在易变段。
+ATTRIBUTION_SYSTEM_PREFIX = """你是 API 测试失败归因助手。你的任务：给定一次失败的全部现场\
+（状态码、响应、断言结果、期望结构），判断这次失败的责任归属。
+
+## 只能从下面的类别中选择
+
+| 类别 | 含义 |
+| :--- | :--- |
+| `request_invalid` | 请求参数不符合接口契约（400/422） |
+| `auth_error` | 凭证无效、过期或权限不足（401/403） |
+| `resource_not_found` | 依赖的资源不存在（404）——通常是测试数据没准备好 |
+| `conflict` | 状态冲突（409）——常见于重复执行或数据未清理 |
+| `rate_limited` | 被限流（429） |
+| `server_error` | 被测服务异常（5xx） |
+| `response_schema_mismatch` | 响应结构与 Spec 声明不符 |
+| `assertion_mismatch` | HTTP 正常但内容不符——**可能是服务错了，也可能是用例的断言写错了** |
+| `network_error` | 连接失败、DNS、TLS、超时——请求未到达或未返回 |
+| `blocked_by_policy` | 被平台安全策略拦截 |
+| `unknown` | 无法归类。**这是缺陷信号，不是正常输出** |
+
+## 硬性规则
+
+1. **不要因为响应体里找不到某个字段就判定结构不符。** 若 `TRUNCATED: true`，\
+说明响应体被截断——字段可能在被截掉的部分里。
+2. **不要臆测没有给出的信息。** 证据只能来自输入里明确出现的内容。
+3. `assertion_mismatch` 天然二义。若用例置信度是 `low`，失败更可能是用例本身的问题。
+4. 若确实无法判断，选 `unknown` 并说明理由。**不要为了给出一个答案而硬选。**
+
+## 输出
+
+严格按给定的 JSON Schema 输出。`evidence` 逐条列出关键信号；`reasoning` 写明判定理由。
+"""
+
+
+def build_attribution_prompt(ctx: FailureContext) -> str:
+    """组装一次归因调用的提示词（LA §5.2）。
+
+    刻意**不包含** `case_id` / `run_id`：归因结论不该依赖"哪条用例"。
+    也不包含请求头与请求体——前者可能含凭证（SR-6），后者对判断
+    "为什么失败"几乎没有帮助。
+    """
+    failures = [
+        item for item in ctx.assertion_outcomes if item.get("outcome") in ("failed", "error")
+    ]
+    volatile = "\n".join(
+        (
+            f"FAILURE_STATUS: {ctx.status}",
+            f"HTTP_STATUS: {ctx.http_status if ctx.http_status is not None else 'null'}",
+            f"ERROR_KIND: {ctx.error_kind or 'null'}",
+            # ★ 必须显式告知截断。模型不知道时，会把"字段在被截掉的部分里"
+            #   误判成"字段缺失"，得出 `response_schema_mismatch` 的错误结论（DM6）。
+            f"TRUNCATED: {'true' if ctx.truncated else 'false'}",
+            f"CASE_CONFIDENCE: {ctx.case_confidence or 'unknown'}",
+            f"ELAPSED_MS: {ctx.elapsed_ms if ctx.elapsed_ms is not None else 'null'}",
+            "ASSERTION_OUTCOMES: " + json.dumps(failures, ensure_ascii=False, sort_keys=True),
+            "EXPECTED_RESPONSE_SCHEMA: "
+            + (
+                json.dumps(ctx.responses_schema, ensure_ascii=False, sort_keys=True)
+                if ctx.responses_schema is not None
+                else "null"
+            ),
+            "",
+            "RESPONSE_BODY:",
+            ctx.response_body or "(空)",
+            "",
+            "请判断这次失败的责任归属。",
+        )
+    )
+    return f"{ATTRIBUTION_SYSTEM_PREFIX}\n{volatile}"
 
 
 _ = GenerationResult  # 保留导入：Schema 由调用方传给 Provider

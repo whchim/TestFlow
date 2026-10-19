@@ -16,9 +16,18 @@ M1 只填最小集（通过率 + 失败清单），其余字段位留着——�
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
-__all__ = ["ExecutionSummary", "FailureItem", "ReportContent", "SkippedItem", "pass_rate"]
+__all__ = [
+    "ExecutionSummary",
+    "FailureItem",
+    "LLMUsageSummary",
+    "ReportContent",
+    "SkippedItem",
+    "pass_rate",
+]
 
 
 class ExecutionSummary(BaseModel):
@@ -32,12 +41,18 @@ class ExecutionSummary(BaseModel):
     failed: int
     timeout: int
     error: int
-    #: 生成但未执行（M1 里只有破坏性用例会被跳过，TE3）。
+    #: 生成但未执行（破坏性用例、被拒绝、尚未了结）。
     skipped: int = 0
+    #: **平台补记**的超时（`error_kind = executor_stall`）。
+    #:
+    #: 与 `timeout` 分开：`timeout` 是"发了请求但目标没按时回应"，
+    #: 是**测试结论**；`unfinished` 是"结果根本没回来"，不是测试结论。
+    #: 它不进通过率分母——否则"我们没跑成"会稀释真实的失败率（RA3 细化）。
+    unfinished: int = 0
 
 
 class FailureItem(BaseModel):
-    """失败清单的一条。M1 不含归因，`category` 由 M3 填。"""
+    """失败清单的一条。"""
 
     model_config = {"extra": "forbid"}
 
@@ -49,6 +64,17 @@ class FailureItem(BaseModel):
     #: 期望与实际，用于让人一眼看出"哪里不一样"。
     expected: str | None = None
     actual: str | None = None
+    #: M3 归因。无归因时为空（例如分析器没跑到这一步）。
+    category: str | None = None
+    method: str | None = None
+    rule_ref: str | None = None
+    llm_model: str | None = None
+    confidence: str | None = None
+    evidence: dict[str, Any] | None = None
+    human_verdict: str | None = None
+    human_category: str | None = None
+    #: 给人看的补充提示。目前只有低置信度 `assertion_mismatch` 会填。
+    hint: str | None = None
 
 
 class SkippedItem(BaseModel):
@@ -63,7 +89,39 @@ class SkippedItem(BaseModel):
     case_id: str
     case_name: str
     reason: str
-    """如 `destructive_not_authorized` / `not_settled`。"""
+    """如 `destructive_not_authorized` / `rejected` / `not_settled`。"""
+
+
+class LLMUsageSummary(BaseModel):
+    """本次 Run 的 LLM 用量与成本（RA6）。
+
+    ## 为什么它不放进 `ExecutionSummary`
+
+    那里是**测试结果**的语义（通过/失败/超时）。成本是**平台开销**，
+    两者混在一起会让"这个数字算不算在通过率里"变成一个要猜的问题。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    calls: int = 0
+    generation_calls: int = 0
+    attribution_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    #: 命中前缀缓存的输入 token（`prompt_tokens` 的子集）。
+    cached_tokens: int = 0
+    #: 缓存命中率 = cached / prompt。长期为 0 是缺陷，不是波动（`07` §5.3）。
+    cache_hit_rate: float | None = None
+    #: 元。**未知模型时为 `None`**——宁可说"不知道"，也不给一个错的金额。
+    cost_cny: float | None = None
+    #: 没有单价、因而未计入 `cost_cny` 的模型名。
+    unpriced_models: list[str] = Field(default_factory=list)
+    #: 单次调用耗时的 P95（毫秒）。包含生成与归因两条路。
+    p95_latency_ms: int | None = None
+    #: 生成采纳率 = 被批准的用例 / 生成的用例。
+    generation_acceptance_rate: float | None = None
+    #: 提供商没有返回 usage 的调用数。>0 说明成本被低估了。
+    usage_missing_calls: int = 0
 
 
 class ReportContent(BaseModel):
@@ -76,6 +134,31 @@ class ReportContent(BaseModel):
     summary: ExecutionSummary
     failures: list[FailureItem] = Field(default_factory=list)
     skipped: list[SkippedItem] = Field(default_factory=list)
+    #: **平台补记的超时**（`executor_stall`）。不是失败、也不是"没跑"，
+    #: 而是"结果没回来"。单独一节列出——否则用户会把它们当成目标服务的
+    #: 性能问题去排查。
+    unfinished_cases: list[SkippedItem] = Field(default_factory=list)
+
+    #: 按**责任归属**分组的失败数。键是组名，顺序即展示顺序。
+    #:
+    #: 零值的组也会出现（RA1）："环境侧 0 条"本身就是一条信息——
+    #: 它告诉用户"不用去查网络"。
+    attribution_groups: dict[str, int] = Field(default_factory=dict)
+
+    #: 规则覆盖率 = 被规则确定性归因的失败数 / 可归因的失败数。
+    #:
+    #: 这是 LogAnalyzer 的第一指标（LA §2.2）：它直接决定成本，
+    #: 也是"要不要补规则"的唯一依据。无失败时为 `None`（不是 0——"没失败"
+    #: 和"规则一条都没覆盖"是两件事）。
+    rule_coverage: float | None = None
+
+    #: 走 LLM 兜底的**归因条数**。⚠️ 它不是真实调用次数（不含生成、重试、
+    #: 失败调用）——真实的数量与成本看 `llm_usage`。保留它是为了兼容
+    #: M3 的既有契约与测试。
+    llm_calls: int = 0
+
+    #: 真实的调用次数、token 与成本（M4）。
+    llm_usage: LLMUsageSummary = Field(default_factory=LLMUsageSummary)
 
 
 def pass_rate(summary: ExecutionSummary) -> float | None:

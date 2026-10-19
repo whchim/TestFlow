@@ -43,20 +43,76 @@ IP 钉死 + 对端校验。而 LLM 提供商的地址来自**应用配置**（`l
 
 from __future__ import annotations
 
+import contextlib
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from urllib.parse import urlsplit
 
+import httpcore2
 import httpx2
 
 from testflow.config import Settings
-from testflow.guardrail.audit import AuditRecord, allow_record
-from testflow.guardrail.errors import GuardrailError
+from testflow.guardrail.audit import AuditRecord, allow_record, deny_record
+from testflow.guardrail.errors import GuardrailError, translate_transport_error
 from testflow.guardrail.pipeline import EgressPolicy, RequestContext
+from testflow.guardrail.policy import DenyReason
+from testflow.observability.logging import get_logger
+from testflow.observability.tracing import current_run_id
 
 __all__ = ["build_llm_http_client", "llm_egress_policy"]
 
+logger = get_logger(__name__)
+
 AuditSink = Callable[[AuditRecord], None]
+
+#: 需要翻译成本项目自己类型的传输异常。
+#:
+#: ## 为什么这里列**基类**，而同步路径是一张逐类型的表
+#:
+#: 同步那边（`transport._ERROR_MAP`）必须逐条列，因为 `httpx` 要求知道
+#: "哪个 `httpcore` 异常对应哪个 `httpx` 异常"——那是一张对应关系。
+#:
+#: 这里不需要那层对应关系：异步路径只回答一个问题——**"这是不是传输层故障？"**。
+#: 而 `httpcore2` 的异常基类只有四个（超时 / 网络 / 协议 / 代理），
+#: 把基类列出来，上游将来新增具体子类（新的超时类型、新的协议错误）
+#: 会自动被覆盖；逐条枚举则会在那时变成一个**静默漏掉**的分类空洞——
+#: 表现为某个罕见的网络错误不重试、`error_kind` 也填不出来，
+#: 而没有任何东西会告诉你漏了哪一个。
+#:
+#: `httpx2.TransportError` 一个就够覆盖 httpx2 全家：它下面挂着
+#: `TimeoutException` / `NetworkError` / `ProtocolError` / `ProxyError` /
+#: `UnsupportedProtocol` / `SSEError`（实测确认）。
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx2.TransportError,
+    httpcore2.NetworkError,  # ConnectError / ReadError / WriteError
+    httpcore2.ProtocolError,  # LocalProtocolError / RemoteProtocolError
+    httpcore2.TimeoutException,  # Connect / Read / Write / PoolTimeout
+    httpcore2.ProxyError,
+)
+
+
+@contextlib.contextmanager
+def _map_transport_errors() -> Iterator[None]:
+    """把 `httpx2`/`httpcore2` 的异常转成 `guardrail` 自己的类型。
+
+    与同步路径同理：调用方（`llm/qwen.py`）不该知道我们用了哪个 HTTP 库。
+    而这里**不只是"整洁"的问题**——重试策略就挂在异常类型上
+    （只重试 `GuardrailTransportError` 的非超时子类）。少翻译一种异常，
+    等到的不是报错，而是"这个错从不重试"，而那是看不出来的。
+
+    ⚠️ 实测确认过这条翻译链**确实必要**：原始 `httpcore2.ConnectError`
+    会原样穿透 `openai` SDK（它的 `request_exceptions()` 只认 `httpx2` 的类型，
+    而 `httpcore2` 与 `httpx2` 是两个独立的异常体系），一路冒到调用方。
+    那时既没有 `error_kind`，也不会触发重试。
+    """
+    try:
+        yield
+    except Exception as exc:
+        if isinstance(exc, GuardrailError):
+            raise
+        if isinstance(exc, _TRANSPORT_ERRORS):
+            raise translate_transport_error(exc) from exc
+        raise
 
 
 def llm_egress_policy(settings: Settings) -> EgressPolicy:
@@ -93,28 +149,36 @@ class _AllowlistAsyncTransport(httpx2.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         host_port = f"{request.url.host}:{request.url.port or _default_port(request.url.scheme)}"
+        ctx = RequestContext(
+            url=str(request.url),
+            method=request.method,
+            direction="llm",
+            # **进程级客户端也要能按 Run 归因。** 构造时还不知道任何 Run
+            # （一个客户端服务所有 Run），所以真实的值只能从当前上下文取；
+            # `self._run_id` 保留给显式构造的单 Run 客户端与测试。
+            run_id=current_run_id() or self._run_id,
+        )
 
         if host_port != self._allowed:
             # **这是平台故障，不是"请求被拒绝"。** LLM 宿主来自配置，
             # 走到这里说明有人把客户端用错了地方——那必须立刻暴露，
             # 而不是变成一条安静的审计记录。
+            #
+            # 但**先记一笔再抛**（GR6：`allow` 与 `deny` 都要记）。
+            # "必须报错"和"必须留痕"不冲突：抛出去之后就没有第二次机会了，
+            # 而"我们曾试图往哪儿发"恰恰是安全复盘时最该能回答的问题。
+            detail = f"LLM 出站目标 {host_port!r} 不在允许范围内（仅允许 {self._allowed!r}）"
+            self._emit(deny_record(ctx, DenyReason.WHITELIST, detail))
+            # `deny_record` 的 `detail` **刻意不落库**（见 `audit.py`）——
+            # 它由调用方写进日志。不写这一行的话，那句解释就哪儿都不存在了。
+            logger.error("LLM 出站被拒：%s", detail)
             raise GuardrailError(
-                f"LLM 出站目标 {host_port!r} 不在允许范围内（仅允许 {self._allowed!r}）。"
-                "这可能意味着某个模块错误地复用了 LLM 客户端去访问别的地址。"
+                f"{detail}。这可能意味着某个模块错误地复用了 LLM 客户端去访问别的地址。"
             )
 
-        self._emit(
-            allow_record(
-                RequestContext(
-                    url=str(request.url),
-                    method=request.method,
-                    direction="llm",
-                    run_id=self._run_id,
-                ),
-                _plan_for(str(request.url)),
-            )
-        )
-        return await self._delegate.handle_async_request(request)
+        self._emit(allow_record(ctx, _plan_for(str(request.url))))
+        with _map_transport_errors():
+            return await self._delegate.handle_async_request(request)
 
     def _emit(self, record: AuditRecord) -> None:
         if self._audit_sink is not None:

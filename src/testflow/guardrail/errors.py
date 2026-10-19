@@ -31,6 +31,7 @@ __all__ = [
     "GuardrailTransportError",
     "PeerVerificationError",
     "classify_transport_error",
+    "translate_transport_error",
 ]
 
 
@@ -136,6 +137,32 @@ def classify_transport_error(exc: BaseException) -> str:
         current = current.__cause__ or current.__context__
 
     return f"transport_{type(exc).__name__.lower()}"
+
+
+def translate_transport_error(exc: BaseException) -> GuardrailTransportError:
+    """把一个**已确认为传输故障**的异常归成本项目的类型。
+
+    "翻译"分两步，而只有第二步是这里的事：判断"这个异常是不是传输故障"
+    由调用方（各自的传输层）负责——因为**两形态用的库不同**
+    （同步路径是 `httpcore`/`httpx`，LLM 路径是 `httpcore2`/`httpx2`），
+    只有它们自己知道该认哪些类型。而"认出来之后叫它什么"两边必须一致，
+    所以那一步收敛在这里。
+
+    这个函数放在 `errors.py` 而不是 `transport.py` 里，是因为**异步路径也要用它**。
+    第一版它叫 `transport._translate`，于是异步路径要么 import 一个别的模块的
+    私有函数，要么自己再写一份——而后者会让两条路径对同一类失败给出不同的
+    `error_kind`，排查时表现为"同一个网络问题在目标路径和 LLM 路径上叫两个名字"。
+
+    `GuardrailTimeout` 与 `GuardrailTransportError` 的区别是**可重试性**：
+    超时重试会让最坏耗时变成乘积（见 `llm/qwen.py` 的 `max_retries=0` 注释），
+    而连接被拒重试一次是合理的。所以这个区分必须准，不能含糊成"都是网络错误"。
+    """
+    kind = classify_transport_error(exc)
+    if kind == "timeout":
+        return GuardrailTimeout(str(exc))
+    error = GuardrailTransportError(str(exc))
+    error.error_kind = kind
+    return error
 
 
 class PeerVerificationError(GuardrailError):

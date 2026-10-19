@@ -1,6 +1,308 @@
 {
   "components": {
     "schemas": {
+      "AttributionCategory": {
+        "description": "归因类别。**取值必须与 `attributions.category` 的 CHECK 逐字一致。**\n\n两边不一致的后果不是报错，而是\"某条归因写不进去\"——且只在跑到那一步时\n才暴露（与 `RunPhase` 同理）。",
+        "enum": [
+          "request_invalid",
+          "auth_error",
+          "resource_not_found",
+          "conflict",
+          "rate_limited",
+          "server_error",
+          "response_schema_mismatch",
+          "assertion_mismatch",
+          "network_error",
+          "blocked_by_policy",
+          "unknown"
+        ],
+        "title": "AttributionCategory",
+        "type": "string"
+      },
+      "AttributionItem": {
+        "description": "一条失败归因。**机器结论与人工表态在同一条里**。\n\n两者并存而不是分成两个接口：用户看归因时关心的就是\"机器判了什么、\n我同意不同意\"——拆开会让他先拉一次列表、再拉一次表态。",
+        "properties": {
+          "attribution_id": {
+            "title": "Attribution Id",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_name": {
+            "title": "Case Name",
+            "type": "string"
+          },
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "dimension": {
+            "title": "Dimension",
+            "type": "string"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "http_status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Http Status"
+          },
+          "human_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Human Category"
+          },
+          "human_verdict": {
+            "anyOf": [
+              {
+                "enum": [
+                  "agree",
+                  "disagree"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Human Verdict"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Model"
+          },
+          "method": {
+            "enum": [
+              "rule",
+              "llm"
+            ],
+            "title": "Method",
+            "type": "string"
+          },
+          "rule_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Ref"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attribution_id",
+          "case_id",
+          "case_name",
+          "dimension",
+          "status",
+          "category",
+          "method"
+        ],
+        "title": "AttributionItem",
+        "type": "object"
+      },
+      "AttributionListResponse": {
+        "description": "归因列表（分页）。分页约定与 `CaseListResponse` 一致。",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AttributionItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "AttributionListResponse",
+        "type": "object"
+      },
+      "CaseListItem": {
+        "description": "确认界面里的一条用例。\n\n## 为什么把 `assertions` 也带出来\n\n确认界面的**全部意义**就是让人看\"这条用例到底要断言什么\"。只给名字与\n维度的话，用户只能凭标题猜——而标题是自然语言，断言是结构化数据，\n两者可以不一致（模型写了个像样的标题配一条错的断言）。\n\n代价是响应体更大，而一页只有 50 条、每条几条断言——可以接受。\n\n⚠️ `request_headers` / `request_body` **刻意不带**：前者可能含凭证\n（SR-6），后者的信息量对\"要不要批准\"这个判断几乎没有帮助。\n需要看请求体的场景应当通过 `GET /api/runs/{id}/report` 的失败清单\n去定位具体问题，而不是把 2000 条用例的请求体塞进列表接口。",
+        "properties": {
+          "assertions": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Assertions",
+            "type": "array"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "category": {
+            "enum": [
+              "normal",
+              "abnormal",
+              "boundary"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "enum": [
+                  "high",
+                  "low"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "dimension": {
+            "title": "Dimension",
+            "type": "string"
+          },
+          "is_destructive": {
+            "title": "Is Destructive",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "request_method": {
+            "title": "Request Method",
+            "type": "string"
+          },
+          "request_path": {
+            "title": "Request Path",
+            "type": "string"
+          },
+          "review_status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ],
+            "title": "Review Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "name",
+          "category",
+          "dimension",
+          "review_status",
+          "is_destructive",
+          "request_method",
+          "request_path"
+        ],
+        "title": "CaseListItem",
+        "type": "object"
+      },
+      "CaseListResponse": {
+        "description": "用例列表（分页）。\n\n`total` 与 `items` 的长度**不是一回事**：前者是全部用例数，\n后者是这一页的数量。少了 `total`，前端就没法显示\"共 N 条\"\n或做\"最后一页\"的判断。",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CaseListItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "CaseListResponse",
+        "type": "object"
+      },
       "CreateRunRequest": {
         "properties": {
           "spec_id": {
@@ -12,6 +314,85 @@
           "spec_id"
         ],
         "title": "CreateRunRequest",
+        "type": "object"
+      },
+      "DecisionApplied": {
+        "description": "本次实际生效的条数。**回显计数而不是只说\"成功\"。**\n\n用户提交了 118 条的决策，界面上回一个 `{\"ok\": true}` 是没用的——\n他要确认的是\"我批的 40 条真的批了\"。数字对不上时立刻能发现。",
+        "properties": {
+          "approved": {
+            "title": "Approved",
+            "type": "integer"
+          },
+          "rejected": {
+            "title": "Rejected",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "approved",
+          "rejected"
+        ],
+        "title": "DecisionApplied",
+        "type": "object"
+      },
+      "DecisionItem": {
+        "additionalProperties": false,
+        "description": "一条人工决策。\n\n`decision` 用 `Literal` 而不是 `str`：拼错的值（`\"approved\"`、\n`\"Approve\"`）必须在**边界上**被拒绝，而不是落库之后变成一个\n`CHECK` 约束报错——那时用户看到的是 500，而真正的原因是他拼错了。",
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "approve",
+              "reject"
+            ],
+            "title": "Decision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "decision"
+        ],
+        "title": "DecisionItem",
+        "type": "object"
+      },
+      "DecisionRequest": {
+        "additionalProperties": false,
+        "description": "IP-1 的决策提交（`05` §4.5）。\n\n## 为什么**必须完整**（所有 pending 用例都要出现）\n\n部分提交会让图带着\"还有未决用例\"的状态恢复，而 IP-1 的语义是\n\"人已经看过了\"。允许部分提交，就等于允许\"没被提到的用例保持 pending\"\n——而它们**既不会被执行，也不会出现在报告里**，用户以为默认是放行。",
+        "properties": {
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/DecisionItem"
+            },
+            "title": "Decisions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "decisions"
+        ],
+        "title": "DecisionRequest",
+        "type": "object"
+      },
+      "DecisionResponse": {
+        "description": "决策已生效。\n\n**200 而不是 202**（M2 的决定）：决策落库是同步且权威的——返回之前\n`review_status` 已经提交，用户的决定**已经生效**。202 的\"已受理、\n尚未处理\"语义反而不对：resume 的投递是内部细节，且失败可恢复\n（投递幂等 + 兜底轮询），不该让它把\"已生效\"降格成\"已受理\"。",
+        "properties": {
+          "applied": {
+            "$ref": "#/components/schemas/DecisionApplied"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "applied"
+        ],
+        "title": "DecisionResponse",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -39,6 +420,91 @@
           "status"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "HumanVerdictRequest": {
+        "additionalProperties": false,
+        "description": "人工对一条归因表态（LA §8）。\n\n`human_category` 的**必填性取决于 verdict**，所以不在这里用 Pydantic\n校验——那样返回的是 FastAPI 默认错误体，而契约要求 `problem+json`\n与可区分的 `code`（LA6）。校验放在路由里。",
+        "properties": {
+          "human_category": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AttributionCategory"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verdict": {
+            "enum": [
+              "agree",
+              "disagree"
+            ],
+            "title": "Verdict",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict"
+        ],
+        "title": "HumanVerdictRequest",
+        "type": "object"
+      },
+      "ReadinessCheck": {
+        "description": "一项依赖的连通性。`detail` 只放异常类型，不放异常消息。",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "ok"
+        ],
+        "title": "ReadinessCheck",
+        "type": "object"
+      },
+      "ReadinessResponse": {
+        "description": "`GET /readyz` 的响应。\n\n与 `/healthz` 的分工：\n`/healthz` 只回答\"进程活着\"（不碰任何依赖），\n`/readyz` 回答\"现在能不能干活\"（会碰 PG 与 Redis）。",
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/ReadinessCheck"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "degraded"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "checks"
+        ],
+        "title": "ReadinessResponse",
         "type": "object"
       },
       "RunCreatedResponse": {
@@ -353,6 +819,318 @@
         ]
       }
     },
+    "/api/runs/{run_id}/attributions": {
+      "get": {
+        "description": "列出某个 Run 的归因。分页约定与 `/cases` 一致。\n\n**一次批量取用例与结果**，不逐条查——一页最多 500 条，\n逐条查就是 1500 次往返（归因 + 用例 + 结果）。",
+        "operationId": "list_attributions_api_runs__run_id__attributions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttributionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "运行不存在（`problem+json`，`code=run_not_found`）"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "列出失败归因（分页）",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/attributions/{attribution_id}": {
+      "patch": {
+        "description": "记录 `agree` / `disagree`，以及（`disagree` 时**必须**给出的）正确类别。\n\n## 为什么 LA6 在路由里校验而不是 Pydantic 里\n\n在 Pydantic 里加 `model_validator` 也能拦住，但它返回的是 FastAPI 默认\n错误体（`{\"detail\": ...}`），而契约要求 `problem+json` 且 `code` 可区分\n（`human_category_required` / `human_category_not_allowed`）。\n调用方需要按 `code` 做分支，而不是解析中文句子。\n\n## 为什么返回 200 而不是 202\n\n表态是同步且权威的：返回之前已经提交，人的判断**已经生效**。",
+        "operationId": "submit_human_verdict_api_runs__run_id__attributions__attribution_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "attribution_id",
+            "required": true,
+            "schema": {
+              "title": "Attribution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HumanVerdictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttributionItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "运行或归因不存在（`problem+json`）"
+          },
+          "422": {
+            "description": "表态与类别不匹配（`problem+json`）"
+          }
+        },
+        "summary": "记录人工归因表态",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/cases": {
+      "get": {
+        "description": "用例列表。**排序是接口语义的一部分，不是实现细节**（`05` §4.3）。\n\n低置信度在前——理由见 `cases_repo._CONFIDENCE_RANK`：那些用例的期望值\n有一部分是推断出来的，正是\"期望写错\"这一类问题的所在。\n\n⚠️ **前端不该自己重排。** 排序放在服务端是刻意的：分页与排序必须由同一个\n地方决定（否则\"第 2 页\"的含义取决于客户端按什么排的，而那个契约\n没人写得下来）。PRD F9 也要求前端不重复实现业务规则。\n\n`limit` 超上限由 FastAPI 直接拒绝（422，走统一的 problem+json 处理器）\n——而不是静默截断到上限：一个\"我请求了 5000 条，拿到 500 条且没有提示\"\n的接口，会让调用方以为自己拿全了。",
+        "operationId": "get_run_cases_api_runs__run_id__cases_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "Run 不存在（`problem+json`，`code=run_not_found`）"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "列出该运行的用例（按置信度排序，分页）",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/decisions": {
+      "post": {
+        "description": "提交批准 / 拒绝，然后把 Run 推离确认门（`05` §4.5）。\n\n## 决策先落库，再投递——顺序不能反（ADR-0009）\n\n`advance()` **不带载荷**：图恢复时只收到\"决策已提交\"这个信号，\n真正的决策从 PG 读（`apply_decisions` 查 `review_status == 'approved'`）。\n\n若把决策放进 resume 载荷，就同时有了\"载荷里的决策\"和\"PG 里的\n`review_status`\"两个事实来源——恢复时以谁为准又成了新问题，\n而它的表现是\"用户批了 40 条，结果跑了另外 40 条\"。\n\n所以 `commit()` **必须在**投递之前：投递只是叫醒推进者，\n它醒来后读的是库。\n\n## 为什么 200、以及为什么第二次提交是 409\n\n提交返回时 `review_status` 已经落库，用户的决定**已经生效**——\n202 的\"已受理、尚未处理\"反而不准确。\n\n第二次提交（两个标签页、双击）会命中 409：要么阶段已经离开\n`awaiting_review`，要么待确认集合已经空了（决策已生效、正在恢复）。\n两种情形的共同含义是\"**这个 Run 现在不需要你确认了**\"，\n所以共用同一个错误码，而 `detail` 把具体情况说清楚。",
+        "operationId": "submit_decisions_api_runs__run_id__decisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "Run 不存在（`problem+json`，`code=run_not_found`）"
+          },
+          "409": {
+            "description": "Run 不在待确认状态，或已无待确认用例（`problem+json`，`code=run_not_awaiting_review`）"
+          },
+          "422": {
+            "description": "决策不完整——有未决用例未出现在请求中（`problem+json`，`code=decision_incomplete`）"
+          }
+        },
+        "summary": "提交人工确认决策（恢复 IP-1）",
+        "tags": [
+          "runs"
+        ]
+      }
+    },
     "/api/runs/{run_id}/events": {
       "get": {
         "description": "SSE 事件流。**只传信号，不传数据**（API7）。\n\n设计上的一条硬约束：事件里只有\"阶段变了\"这种信号，**没有用例内容、\n没有响应体**。两条理由：\n\n* 数据走两条路会立刻产生\"哪个是权威\"的问题——而 REST 是权威\n* SSE 连接可能很长，把数据塞进去意味着它会被缓存在中间层\n  （代理、浏览器），而那些缓存不受我们的留存策略管辖\n\n## ⚠️ M1 的实现方式：**短间隔轮询数据库**\n\n真正的\"事件推送\"要求 Gateway 知道编排器/Worker 侧的进展，而那需要一条\n跨进程的事件总线。M1 没有它——所以这里按固定间隔查 `runs` 表，\n阶段变了就发一条事件。\n\n**这是一个偏差，要记录在案**：延迟是轮询间隔的量级（秒），\n而真推送是毫秒。代价换来的是不引入一套总线——Redis pub/sub 会因为\n断线丢消息，而\"REST 是权威\"这条退路让我们**丢了消息也不影响正确性**，\n只是晚一点收到通知。",
@@ -549,6 +1327,38 @@
           }
         },
         "summary": "存活检查",
+        "tags": [
+          "ops"
+        ]
+      }
+    },
+    "/readyz": {
+      "get": {
+        "description": "**会碰依赖**的就绪检查：PG 与 Redis 都能用才返回 200。\n\n与 `/healthz` 的分工是刻意的（`10` §5）：\n\n* `/healthz` 不碰任何依赖——否则数据库抖一下，编排器会把一个\n  **健康的 Gateway** 判死并重启，而重启解决不了数据库的问题\n* `/readyz` 明确回答\"现在能不能干活\"，供人、负载均衡与部署脚本使用\n\n依赖不可达时返回 **503 + problem 形状的 JSON**，而不是 200 加一个\n布尔字段——后者会让所有只看状态码的调用方以为一切正常。\n\n`detail` 只写**异常类型**。异常消息里可能有连接串、库名或路径，\n而这个端点不需要认证（运维探针要能直接打）。",
+        "operationId": "readyz_readyz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponse"
+                }
+              }
+            },
+            "description": "依赖不可达"
+          }
+        },
+        "summary": "就绪检查",
         "tags": [
           "ops"
         ]

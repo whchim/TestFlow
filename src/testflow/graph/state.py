@@ -58,7 +58,19 @@ class GraphState(TypedDict, total=False):
     # 这些值会因为崩溃、重投、并发而落后，而"缓存落后"导致的最坏情况是
     # "该推进时不推进"——那正是兜底轮询要解决的问题，它自己不能再依赖
     # 一个可能不准的值。
-    expected_case_count: int
+    #
+    # ★ **叫 `generated` 而不是 `expected`**（M2 改名）。
+    #
+    # 它数的是 N2 **生成了多少条**用例。而 `runs.expected_case_count`
+    # 数的是**应当有结果多少条**（`approved` 且非破坏性）——那是完成判定的
+    # 分母。两者在有被拒绝或破坏性用例时会分叉。
+    #
+    # 同一个名字承担两个含义是**主动制造 bug**：M2 的 `collect_results`
+    # 正是拿"生成条数"当"应当有结果条数"用了，于是每次运行都多记一条
+    # 假的 `partial_results`，而去补记缺失的那些为 timeout
+    # （把"用户主动跳过"写成"目标接口超时"）。改名让两者在**读代码时**
+    # 就不可能混淆——而这比在注释里写"注意这两个不是一个东西"可靠得多。
+    generated_case_count: int
     settled_case_count: int
 
     # —— 错误累积 ——
@@ -82,7 +94,7 @@ def initial_state(*, run_id: str, spec_id: str, spec_fingerprint: str) -> GraphS
         approved_case_ids=[],
         attribution_ids=[],
         report_id=None,
-        expected_case_count=0,
+        generated_case_count=0,
         settled_case_count=0,
         node_failures=[],
         retry_counts={},

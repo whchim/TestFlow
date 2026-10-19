@@ -18,30 +18,44 @@
 写入之后不再重渲染，模板改了也不回填。报告会被引用（评审材料、问题工单），
 三个月前那份应当保持原样——**"当时看到的"和"现在查到的"必须一致**。
 
-## M1 的范围
+## 归因（M3）
 
-路线图：**最小模板，只出通过率与失败清单**。归因分组、维度覆盖、
-置信度分布属于 M3——而 `ReportContent` 的结构已经留好了位置。
+失败清单带上了归因类别、方法（规则 / LLM）与置信度；另有一节按
+**责任归属**分组——使用者要做的第一个决定不是"这是哪一类失败"，
+而是"该去找谁"。零值的组也会列出，那本身就是信息。
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sqlalchemy.orm import Session
 
+from testflow.domain.attribution import (
+    RESPONSIBILITY_GROUPS,
+    is_synthesized_stall,
+    responsibility_of,
+)
 from testflow.domain.report import (
     ExecutionSummary,
     FailureItem,
+    LLMUsageSummary,
     ReportContent,
     SkippedItem,
     pass_rate,
 )
+from testflow.llm.pricing import PriceTier, estimate_cost
 from testflow.observability.logging import get_logger
-from testflow.storage.models import Report
+from testflow.observability.stats import percentile
+from testflow.storage.models import Attribution, LLMUsage, Report
+from testflow.storage.repositories import attributions as attributions_repo
 from testflow.storage.repositories import cases as cases_repo
+from testflow.storage.repositories import llm_usage as llm_usage_repo
 from testflow.storage.repositories import reports as reports_repo
 from testflow.storage.repositories import results as results_repo
 from testflow.storage.repositories import runs as runs_repo
@@ -62,11 +76,18 @@ def summarize(session: Session, run_id: uuid.UUID) -> ExecutionSummary:
     """
     results = results_repo.list_by_run(session, run_id)
     by_status: dict[str, int] = {}
+    unfinished = 0
     for row in results:
+        # 补记的超时**不是测试结论**，单列成"未完成"。
+        # 混进 `timeout` 会让通过率分母变大，把真实的失败率说小——
+        # 而它本来就不该在分母里（RA3 的细化）。
+        if is_synthesized_stall(row.status, row.error_kind):
+            unfinished += 1
+            continue
         by_status[row.status] = by_status.get(row.status, 0) + 1
 
     total = cases_repo.count_by_run(session, run_id)
-    executed = len(results)
+    executed = len(results) - unfinished
 
     return ExecutionSummary(
         total_cases=total,
@@ -75,26 +96,49 @@ def summarize(session: Session, run_id: uuid.UUID) -> ExecutionSummary:
         failed=by_status.get("failed", 0),
         timeout=by_status.get("timeout", 0),
         error=by_status.get("error", 0),
-        # 跳过的 = 总数 − 已执行。M1 里主要是破坏性用例（TE3）。
-        # **这个数必须算出来并呈现**，因为"没测什么"和"测了都过了"
+        # 跳过的 = 总数 − 有结果行的。主要是破坏性用例（TE3）与被拒绝的用例
+        # （IP-1）。**这个数必须算出来并呈现**，因为"没测什么"和"测了都过了"
         # 是两份含义完全不同的报告（RA2）。
-        skipped=max(total - executed, 0),
+        skipped=max(total - len(results), 0),
+        unfinished=unfinished,
     )
 
 
-def build_report(session: Session, run_id: uuid.UUID) -> Report:
-    """构造并落库报告。**幂等**——同一个 Run 重复调用会覆盖同一行（`run_id` 有 UNIQUE）。"""
+def build_report(
+    session: Session,
+    run_id: uuid.UUID,
+    *,
+    price_table: Mapping[str, Sequence[PriceTier]] | None = None,
+) -> Report:
+    """构造并落库报告。**幂等**——重复调用覆盖同一行（`run_id` 有 UNIQUE）。
+
+    `price_table` 只在测试/基准里显式传；生产用 `llm/pricing.py` 的默认表。
+    成本随报告一起**快照落库**，所以单价日后变化不会改写历史报告（RA4）。
+    """
     run = runs_repo.get(session, run_id)
     if run is None:
         raise ValueError(f"Run 不存在：{run_id}")
 
     summary = summarize(session, run_id)
+    attributions = attributions_repo.list_by_run(session, run_id)
+    total_failures = summary.failed + summary.timeout + summary.error
     content = ReportContent(
         run_id=str(run_id),
         spec_fingerprint=run.spec_fingerprint,
         summary=summary,
-        failures=_failures(session, run_id),
+        failures=_failures(session, run_id, attributions),
         skipped=_skipped(session, run_id),
+        unfinished_cases=_unfinished_cases(session, run_id),
+        attribution_groups=_attribution_groups(attributions),
+        rule_coverage=_rule_coverage(attributions, total_failures),
+        llm_calls=sum(1 for row in attributions if row.method == "llm"),
+        llm_usage=_llm_usage_summary(
+            session,
+            run_id,
+            generated_cases=summary.total_cases,
+            approved_cases=cases_repo.count_by_run(session, run_id, review_status="approved"),
+            price_table=price_table,
+        ),
     )
 
     rendered = render_markdown(content)
@@ -112,17 +156,23 @@ def build_report(session: Session, run_id: uuid.UUID) -> Report:
     return report
 
 
-def _failures(session: Session, run_id: uuid.UUID) -> list[FailureItem]:
-    """失败清单。M1 不含归因——`category` 由 M3 填。
+def _failures(
+    session: Session, run_id: uuid.UUID, attributions: list[Attribution]
+) -> list[FailureItem]:
+    """失败清单（含归因）。
 
     把超时与请求层错误也列进来：它们是**测试结论**（TE7），不是系统故障，
     而用户最想先看到的就是"哪些没通过"。
+
+    **补记的超时不列**：它们不是测试结论，属于"未完成"章节。
     """
+    by_case = {row.case_id: row for row in attributions}
     items: list[FailureItem] = []
     for row in results_repo.list_by_run(session, run_id):
-        if row.status == "passed":
+        if row.status == "passed" or is_synthesized_stall(row.status, row.error_kind):
             continue
         case = cases_repo.get(session, row.case_id)
+        attribution = by_case.get(row.case_id)
         items.append(
             FailureItem(
                 case_id=str(row.case_id),
@@ -132,11 +182,129 @@ def _failures(session: Session, run_id: uuid.UUID) -> list[FailureItem]:
                 http_status=row.http_status,
                 expected=_first_expectation(row.assertion_outcomes),
                 actual=_first_mismatch(row.assertion_outcomes),
+                category=attribution.category if attribution else None,
+                method=attribution.method if attribution else None,
+                rule_ref=attribution.rule_ref if attribution else None,
+                llm_model=attribution.llm_model if attribution else None,
+                confidence=attribution.confidence if attribution else None,
+                evidence=attribution.evidence if attribution else None,
+                human_verdict=attribution.human_verdict if attribution else None,
+                human_category=attribution.human_category if attribution else None,
+                hint=_attribution_hint(attribution, case),
             )
         )
     # 稳定排序：报告两次生成的内容应当逐字一致，否则 diff 全是噪音。
     items.sort(key=lambda item: (item.status, item.case_name))
     return items
+
+
+def _attribution_hint(attribution: Attribution | None, case: Any) -> str | None:
+    """低置信度用例的 `assertion_mismatch` 必须显式提示（LA3）。
+
+    不提示的后果：用户看到"断言不符"，以为服务坏了，而实际上很可能是
+    这条用例的断言本来就是猜的。
+    """
+    if attribution is None or attribution.category != "assertion_mismatch":
+        return None
+    if case is None or case.confidence != "low":
+        return None
+    return "该用例的断言为推断所得，失败可能是用例本身的问题"
+
+
+def _attribution_groups(attributions: list[Attribution]) -> dict[str, int]:
+    """按责任归属分组。**零值的组也返回**——"环境侧 0 条"本身是信息。"""
+    groups = dict.fromkeys(RESPONSIBILITY_GROUPS, 0)
+    for row in attributions:
+        group = responsibility_of(row.category)
+        groups[group] = groups.get(group, 0) + 1
+    return groups
+
+
+def _rule_coverage(attributions: list[Attribution], total_failures: int) -> float | None:
+    """规则覆盖率 = 规则归因数 / 可归因失败数（LA §2.2）。
+
+    分母用 `case_results` 统计出来的失败数，**不是归因行数**——
+    用行数会让"分析器漏了一条"变成"覆盖率 100%"。
+    """
+    if total_failures == 0:
+        return None
+    rule_attributed = sum(1 for row in attributions if row.method == "rule")
+    return rule_attributed / total_failures
+
+
+def _llm_usage_summary(
+    session: Session,
+    run_id: uuid.UUID,
+    *,
+    generated_cases: int,
+    approved_cases: int,
+    price_table: Mapping[str, Sequence[PriceTier]] | None = None,
+) -> LLMUsageSummary:
+    """从库里取用量行，交给纯函数聚合。"""
+    return summarize_usage(
+        llm_usage_repo.list_by_run(session, run_id),
+        generated_cases=generated_cases,
+        approved_cases=approved_cases,
+        price_table=price_table,
+    )
+
+
+def summarize_usage(
+    rows: Sequence[LLMUsage],
+    *,
+    generated_cases: int,
+    approved_cases: int,
+    price_table: Mapping[str, Sequence[PriceTier]] | None = None,
+) -> LLMUsageSummary:
+    """把逐次用量聚合成报告里的"质量与成本"（纯函数，便于单测）。
+
+    ## 三条"不知道就说不知道"的规则
+
+    1. **没有调用 → 成本 0.0**（纯规则 Run 确实没花钱），不是 `None`。
+    2. **有调用但某个模型没有单价 → 成本 `None`**，并列出模型名。
+       给出一个"只算了部分模型"的金额，比不给更糟——它看起来是权威的。
+    3. **命中率的分母是 0 → `None`**（没有输入就没有命中率），不是 0%。
+    """
+    acceptance = approved_cases / generated_cases if generated_cases > 0 else None
+
+    if not rows:
+        # 没有调用 = 没花钱（纯规则 Run 是正常情形）。注意这与
+        # "某次调用没回 usage" 不同——那种由 `usage_missing_calls` 标记。
+        return LLMUsageSummary(cost_cny=0.0, generation_acceptance_rate=acceptance)
+
+    prompt_tokens = sum(row.prompt_tokens for row in rows)
+    cached_tokens = sum(row.cached_tokens for row in rows)
+
+    total_cost = Decimal(0)
+    unpriced: set[str] = set()
+    for row in rows:
+        row_cost = estimate_cost(
+            row.model,
+            prompt_tokens=row.prompt_tokens,
+            completion_tokens=row.completion_tokens,
+            cached_tokens=row.cached_tokens,
+            cache_write_tokens=row.cache_write_tokens,
+            price_table=price_table,
+        )
+        if row_cost is None:
+            unpriced.add(row.model)
+        else:
+            total_cost += row_cost
+
+    return LLMUsageSummary(
+        calls=len(rows),
+        generation_calls=sum(1 for row in rows if row.purpose == "case_generation"),
+        attribution_calls=sum(1 for row in rows if row.purpose == "attribution"),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=sum(row.completion_tokens for row in rows),
+        cached_tokens=cached_tokens,
+        cache_hit_rate=(cached_tokens / prompt_tokens) if prompt_tokens > 0 else None,
+        cost_cny=None if unpriced else float(total_cost),
+        unpriced_models=sorted(unpriced),
+        p95_latency_ms=percentile([row.elapsed_ms for row in rows], 0.95),
+        generation_acceptance_rate=acceptance,
+        usage_missing_calls=sum(1 for row in rows if row.total_tokens == 0),
+    )
 
 
 def _first_expectation(outcomes: list | None) -> str | None:
@@ -157,22 +325,49 @@ def _first_mismatch(outcomes: list | None) -> str | None:
     return None
 
 
+def _unfinished_cases(session: Session, run_id: uuid.UUID) -> list[SkippedItem]:
+    """列出补记超时的用例。**不能只给一个数字**——用户要知道是哪几条。"""
+    items: list[SkippedItem] = []
+    for row in results_repo.list_by_run(session, run_id):
+        if not is_synthesized_stall(row.status, row.error_kind):
+            continue
+        case = cases_repo.get(session, row.case_id)
+        items.append(
+            SkippedItem(
+                case_id=str(row.case_id),
+                case_name=case.name if case else "(用例已删除)",
+                reason="executor_stall",
+            )
+        )
+    items.sort(key=lambda item: item.case_name)
+    return items
+
+
 def _skipped(session: Session, run_id: uuid.UUID) -> list[SkippedItem]:
     """未执行的用例。**RA2 要求报告显式列出"没测什么"。**
 
     不列出来的后果是报告看起来"全绿"，而实际上有一类用例从未运行——
     那比没有报告更危险。
+
+    未执行分三种原因，报告里要能分清：被用户**拒绝**（IP-1）、
+    破坏性用例未授权（TE3）、以及其余"尚未了结"（超时/崩溃兜底）。
     """
     executed = {row.case_id for row in results_repo.list_by_run(session, run_id)}
     skipped: list[SkippedItem] = []
     for case in cases_repo.list_by_run(session, run_id):
         if case.id in executed:
             continue
+        if case.review_status == "rejected":
+            reason = "rejected"
+        elif case.is_destructive:
+            reason = "destructive_not_authorized"
+        else:
+            reason = "not_settled"
         skipped.append(
             SkippedItem(
                 case_id=str(case.id),
                 case_name=case.name,
-                reason="destructive_not_authorized" if case.is_destructive else "not_settled",
+                reason=reason,
             )
         )
     return skipped

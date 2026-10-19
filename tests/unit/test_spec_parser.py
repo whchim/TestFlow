@@ -266,6 +266,104 @@ class TestRefExpansion:
         else:  # pragma: no cover —— 未命中说明展开没有停下来
             pytest.fail("递归结构没有被展开深度限制截断")
 
+    def test_unresolved_ref_is_marked_per_operation_not_per_document(self) -> None:
+        """`$ref` 展开超限是**逐接口**发生的（`04` §2.2）。
+
+        曾经的做法是把"整份文档有没有未展开的引用"盖给每个接口：一份 Spec 里
+        只要有一个递归结构，其余接口**全部**被标成信息不完整。而低置信度会
+        顺着 `LogAnalyzer` LA3 传导到归因——一条真实的服务缺陷会被报告成
+        "该用例的断言是推断的，失败可能是用例本身的问题"。
+
+        所以这里必须验**另一条接口仍然干净**，只验"递归接口被标了"是验不出来的。
+        """
+        doc = json.dumps(
+            {
+                "openapi": "3.0.3",
+                "info": {"title": "d", "version": "1"},
+                "paths": {
+                    "/tree": {
+                        "get": {
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {
+                                        "application/json": {
+                                            "schema": {"$ref": "#/components/schemas/Tree"}
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "/plain": {
+                        "get": {
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {
+                                        "application/json": {
+                                            "schema": {"$ref": "#/components/schemas/Flat"}
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    },
+                },
+                "components": {
+                    "schemas": {
+                        "Tree": {
+                            "type": "object",
+                            "properties": {"child": {"$ref": "#/components/schemas/Tree"}},
+                        },
+                        "Flat": {"type": "object", "properties": {"ok": {"type": "boolean"}}},
+                    }
+                },
+            }
+        )
+        parsed = parse_spec(doc)
+        by_path = {op.path: op for op in parsed.operations}
+
+        assert by_path["/tree"].has_unresolved_ref is True
+        assert by_path["/plain"].has_unresolved_ref is False
+
+    def test_path_level_parameters_count_toward_the_operation(self) -> None:
+        """路径级 `parameters` 被合进 `parameters_schema`，所以它也必须被扫到。
+
+        只看 `operation` 字典会漏掉这一块——而漏掉的表现是**恰好反过来**的：
+        信息不完整的接口被当成完整的，用例以高置信度生成。
+        """
+        doc = json.dumps(
+            {
+                "openapi": "3.0.3",
+                "info": {"title": "d", "version": "1"},
+                "paths": {
+                    "/t/{id}": {
+                        "parameters": [{"$ref": "#/components/parameters/TreeParam"}],
+                        "get": {"responses": {"200": {"description": "ok"}}},
+                    }
+                },
+                "components": {
+                    "parameters": {
+                        "TreeParam": {
+                            "name": "id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"$ref": "#/components/schemas/Tree"},
+                        }
+                    },
+                    "schemas": {
+                        "Tree": {
+                            "type": "object",
+                            "properties": {"child": {"$ref": "#/components/schemas/Tree"}},
+                        }
+                    },
+                },
+            }
+        )
+        parsed = parse_spec(doc)
+        assert parsed.operations[0].has_unresolved_ref is True
+
     @pytest.mark.parametrize("arity", [2, 5, 10, 20])
     def test_exponential_blowup_is_bounded(self, arity: int) -> None:
         """**深度限制单独挡不住指数爆炸。**
@@ -316,7 +414,11 @@ class TestRefExpansion:
         elapsed = time.perf_counter() - started
 
         assert parsed.operations[0].has_unresolved_ref is True
-        assert elapsed < 5.0, f"展开未在有界时间内收敛：{elapsed:.1f}s"
+        # 阈值是"有界 vs 指数爆炸"的分界，不是性能指标。
+        # 预算失效时 n=20 要处理 10^13 个节点——那是指数级、小时级；
+        # 有预算时即使叠加覆盖率插桩的开销也只在个位数秒。
+        # 原来的 5 秒在 `--cov` 下会偶发超线（实测 6.8s），与正确性无关。
+        assert elapsed < 15.0, f"展开未在有界时间内收敛：{elapsed:.1f}s"
 
     def test_high_arity_does_not_exhaust_memory(self) -> None:
         """n=50 时 n^10 是 10^17——比上面最坏的情形还大 4 个数量级。
