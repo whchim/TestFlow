@@ -65,6 +65,10 @@ LLM 调用次数、缓存命中与成本。
 | <http://127.0.0.1:3000/healthz> | 存活检查 |
 | <http://127.0.0.1:3000/readyz> | 就绪检查（PG + Redis） |
 
+首次打开前端时，在右上角填写 Token——与 `.env` 里的 `TESTFLOW_API_TOKEN` 相同
+（compose 默认是 `dev-api-token`）。Token 只保存在本机浏览器的 `localStorage`，
+之后刷新页面不需要重新输入。
+
 ## 使用
 
 ```bash

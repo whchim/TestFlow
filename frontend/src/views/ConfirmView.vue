@@ -2,7 +2,15 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { ApiError, TERMINAL_PHASES, api, describePhase, type CaseItem, type RunStatus } from '@/api'
+import {
+  ApiError,
+  TERMINAL_PHASES,
+  api,
+  describePhase,
+  hasToken,
+  type CaseItem,
+  type RunStatus,
+} from '@/api'
 import CaseCard from '@/components/CaseCard.vue'
 
 /**
@@ -97,8 +105,14 @@ async function submit() {
 onMounted(async () => {
   await refresh()
   if (!TERMINAL_PHASES.has(status.value?.phase ?? '')) {
-    source = new EventSource(`/api/runs/${encodeURIComponent(props.id)}/events`)
-    source.addEventListener('run.phase', () => void refresh())
+    // ⚠️ `EventSource` **无法携带自定义请求头**，所以开启鉴权时 SSE 会 401。
+    // REST 才是权威（API7），SSE 只是"该查了"的提示——于是这里退化成
+    // 低频轮询：功能不变，只是状态更新最多晚 5 秒。
+    // 没开鉴权（本机环回 + 空 token）时仍然走 SSE，保持原来的实时性。
+    if (!hasToken()) {
+      source = new EventSource(`/api/runs/${encodeURIComponent(props.id)}/events`)
+      source.addEventListener('run.phase', () => void refresh())
+    }
     // 兜底轮询：SSE 的中间层（代理、nginx）可能缓冲掉事件，
     // 而事件流的实现本身是**短间隔轮询**（M1 的偏差，`05` §4.4）。
     // 一个低频的兜底查询保证界面最终会追上，代价可以忽略。

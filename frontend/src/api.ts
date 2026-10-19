@@ -36,10 +36,44 @@ export class ApiError extends Error {
     // `title` 是给人读的，`detail` 补充原因。两者都拼上——
     // 只显示 title 会让用户看到"决策不完整"却不知道为什么。
     const text = [problem?.title, problem?.detail].filter(Boolean).join('：')
-    super(text || `请求失败（HTTP ${status}）`)
+    // 401 且本机还没填 Token 时，直接把"该去哪儿填"说出来。否则用户只能
+    // 看到一个"未认证"，而页面上没有任何地方提示他缺了什么。
+    const hint = status === 401 && !getToken() ? '（请先在右上角填写 Token）' : ''
+    super((text || `请求失败（HTTP ${status}）`) + hint)
     this.status = status
     this.code = problem?.code ?? `http_${status}`
     this.problem = problem
+  }
+}
+
+// --------------------------------------------------------------- 用户令牌
+//
+// 浏览器端保存 Token 并随请求发送。存在 `localStorage` 而不是内存里：
+// 刷新页面后不该让用户重新输入一次。它是单机自用工具，同源脚本本来就能
+// 读写这个页面的全部状态，**不会因为换一种存储方式变得更安全**。
+
+const TOKEN_KEY = 'testflow.api_token'
+
+export function getToken(): string {
+  return (localStorage.getItem(TOKEN_KEY) ?? '').trim()
+}
+
+export function setToken(value: string): void {
+  const token = value.trim()
+  if (token) localStorage.setItem(TOKEN_KEY, token)
+  else localStorage.removeItem(TOKEN_KEY)
+}
+
+export function hasToken(): boolean {
+  return getToken() !== ''
+}
+
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = getToken()
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(extra ?? {}),
   }
 }
 
@@ -102,7 +136,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(`${BASE}${path}`, {
       ...init,
-      headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+      headers: authHeaders(init?.headers as Record<string, string> | undefined),
     })
   } catch {
     // `fetch` 只在**网络层**失败时 reject（连不上、被拦截）。
@@ -160,7 +194,7 @@ export const api = {
   /** 取 Markdown 形态的报告（写入时的快照，RA4）。 */
   async getReportMarkdown(runId: string): Promise<string> {
     const response = await fetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/report`, {
-      headers: { Accept: 'text/markdown' },
+      headers: authHeaders({ Accept: 'text/markdown' }),
     })
     if (!response.ok) {
       let problem: ProblemDetail | undefined
