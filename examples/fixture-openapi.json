@@ -1,0 +1,464 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "TestFlow Fixture API",
+    "description": "TestFlow 的可控被测对象。每个端点对应一条设计文档中写死的行为，是那些行为的可执行规格。见 `docs/09-测试策略.md` §3.2。",
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://fixture:9000"
+    }
+  ],
+  "paths": {
+    "/ok": {
+      "get": {
+        "summary": "正常路径",
+        "description": "200 + 合法 JSON。用于验证最基本的正常流程。",
+        "operationId": "ok_ok_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/echo": {
+      "get": {
+        "summary": "回显请求",
+        "description": "回显请求内容。用于验证 `json_path` / `header` 各 operator 的求值。\n\n**只注册 GET 与 POST**：PUT / PATCH 属于破坏性方法，会被 Guardrail 拦下\n（SR-3），挂在这里也打不到。而显式的 `operation_id` 是必需的——用\n`api_route` 挂多个方法时 FastAPI 会给每个方法生成**同一个** operationId，\n而本服务的 `/openapi.json` 要作为测试输入喂给 SpecParser，不能带这种脏数据。",
+        "operationId": "echo_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "回显请求",
+        "description": "回显请求内容。用于验证 `json_path` / `header` 各 operator 的求值。\n\n**只注册 GET 与 POST**：PUT / PATCH 属于破坏性方法，会被 Guardrail 拦下\n（SR-3），挂在这里也打不到。而显式的 `operation_id` 是必需的——用\n`api_route` 挂多个方法时 FastAPI 会给每个方法生成**同一个** operationId，\n而本服务的 `/openapi.json` 要作为测试输入喂给 SpecParser，不能带这种脏数据。",
+        "operationId": "echo_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/no-content": {
+      "get": {
+        "summary": "204 无响应体",
+        "description": "无 body。用于验证 `json_path` 断言在空 body 上的行为。",
+        "operationId": "no_content_no_content_get",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/bad-json": {
+      "get": {
+        "summary": "200 但响应体不是 JSON",
+        "description": "**返回 200，声称是 JSON，实际是 HTML。**\n\n这是 `03/TestExecutor.md` TE2（断言级三态）**唯一**的验证手段。\n\n如果实现把\"断言无法求值\"（`error`）与\"断言不成立\"（`failed`）合并成\n一态——那是更短的代码、看起来更干净——**其他所有测试仍然是绿的**，\n只有这个端点能暴露它。\n\n真实场景中它对应\"服务返回了一个错误页面，却声称 Content-Type 是 JSON\"。",
+        "operationId": "bad_json_bad_json_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/error-500": {
+      "get": {
+        "summary": "服务端异常",
+        "description": "500。用于验证 `server_error` 归因规则。",
+        "operationId": "error_500_error_500_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/invalid-echo": {
+      "post": {
+        "summary": "请求校验失败",
+        "description": "400 + 校验错误结构。用于验证 `request_invalid` 归因规则。\n\n形状模仿 FastAPI 的校验错误（`03/LogAnalyzer.md` Q2：MVP 先支持\nFastAPI / Spring 的常见结构）。",
+        "operationId": "invalid_echo_invalid_echo_post",
+        "responses": {
+          "400": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/slow": {
+      "get": {
+        "summary": "响应慢于 HTTP 超时",
+        "description": "延迟返回。用于验证 TE7 的三层超时与 `timeout` 状态。\n\n默认 30 秒——刻意超过 `http_timeout_s`（默认 10s），使请求必然超时。",
+        "operationId": "slow_slow_get",
+        "parameters": [
+          {
+            "name": "seconds",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 30.0,
+              "title": "Seconds"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/redirect": {
+      "get": {
+        "summary": "返回 3xx 重定向",
+        "description": "302 重定向。用于验证 SR-4（不跟随重定向）。\n\n`?to=` 可指向任意地址——包括元数据地址（`http://169.254.169.254/`），\n用来验证\"即使目标在白名单内，重定向也不会被跟随\"。",
+        "operationId": "redirect_redirect_get",
+        "parameters": [
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "/ok",
+              "title": "To"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/large": {
+      "get": {
+        "summary": "响应体超过截断上限",
+        "description": "返回超过 256 KB 的响应体。用于验证 `04` DM6（截断 + `truncated` 标记）。\n\n默认 512 KB，是截断上限（256 KB）的两倍。",
+        "operationId": "large_large_get",
+        "parameters": [
+          {
+            "name": "kb",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 4096,
+              "exclusiveMinimum": 0,
+              "default": 512,
+              "title": "Kb"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/recursive": {
+      "get": {
+        "summary": "递归嵌套结构",
+        "description": "返回递归嵌套的树。\n\n它的**接口文档**（`/openapi.json`）中含有自引用的 `$ref`，是 `SpecParser`\nSP1（展开深度上限）的验证素材。",
+        "operationId": "recursive_recursive_get",
+        "parameters": [
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 32,
+              "minimum": 0,
+              "default": 3,
+              "title": "Depth"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TreeNode"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/destructive": {
+      "delete": {
+        "summary": "破坏性方法",
+        "description": "接受 DELETE。用于验证 SR-3 的**第二层拦截**。\n\nN4 会在投递前过滤掉破坏性用例（第一层）。本端点用于验证第二层：\n即使有人绕过了应用层逻辑、真的把 DELETE 发了出去，Guardrail 也应拦下。\n\n断言方式不是\"收到了拒绝\"，而是**查询 `/__hits` 确认本端点从未被访问**。",
+        "operationId": "destructive_destructive_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "OkResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "data"
+        ],
+        "title": "OkResponse"
+      },
+      "TreeNode": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "child": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TreeNode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "TreeNode",
+        "description": "自引用模型——FastAPI 会为它生成递归的 `$ref` 结构。\n\n这正是 `SpecParser` SP1（`$ref` 展开深度上限）需要处理的情形。"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "ValidationErrorItem": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Loc"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Msg"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationErrorItem"
+      },
+      "ValidationErrorResponse": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationErrorItem"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "ValidationErrorResponse"
+      }
+    }
+  }
+}

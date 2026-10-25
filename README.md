@@ -69,6 +69,11 @@ LLM 调用次数、缓存命中与成本。
 （compose 默认是 `dev-api-token`）。Token 只保存在本机浏览器的 `localStorage`，
 之后刷新页面不需要重新输入。
 
+想立刻试一下的话，可以直接上传
+[`examples/fixture-openapi.json`](examples/fixture-openapi.json)——它是内置
+fixture 服务的接口文档，包含一半刻意会失败的端点，详见
+[`examples/README.md`](examples/README.md)。
+
 ## 使用
 
 ```bash
