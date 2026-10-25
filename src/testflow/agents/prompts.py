@@ -68,20 +68,31 @@ SYSTEM_PREFIX = """你是 API 测试用例生成助手。你的任务：给定�
 3. **禁止生成 LLM 判定型断言**——断言必须可确定性求值。可用的类型只有下面这些。
 4. **不要把任何凭证放进请求头或请求体**。凭证由平台在执行时按主机注入。
 5. 取值必须**合法且有区分度**：`value_valid` 维度给一组能通过校验的输入；\
-边界维度给刚好在边界上的值。
+边界维度给**恰好**在边界上的值：`len_max` 的长度等于 `maxLength`、\
+`len_max_over` 等于 `maxLength + 1`、`max` 等于 `maximum`、\
+`max_over` 等于 `maximum + step`（`step` 取 `multipleOf`，没有则为 1）。\
+字段有 `multipleOf` 时，越界值也必须同时满足它（例如 `maximum=100`、\
+`multipleOf=5` → `max_over` 用 105，不是 101）。\
+`format` 无法判断时，给一个符合常见语义的合法值（例如 IMEI 是 15 位数字）。
 6. 维度名形如 `status:409` 表示"期望返回该状态码"——对应用例必须断言它。
 7. 接口 `responses` 里声明的**每个 4xx 状态码**至少要有 1 条用例断言它。\
 若清单里没有对应维度，可以补充维度，但必须把该用例标为 `inferred`，\
 且额外维度**不得超过给定维度的一半**。
-8. **请求体写在 `request_body_json` 字段里**，值为一个 **JSON 字符串**：\
+8. **只有 `responses` 中对应状态码下声明了 `content.schema` 时**，才能使用\
+`schema_valid` 断言；没有声明响应体结构的，不要用这个断言类型。
+9. **请求体写在 `request_body_json` 字段里**，值为一个 **JSON 字符串**：\
 键和字符串值都用双引号，例如 `"{\"name\": \"Alice\", \"age\": 30}"`。\
 不要使用 `request_body` 字段；不要输出 YAML；\
 不要包成 `{"content": ...}`、`{"type": ..., "value": ...}` 或 `{"body": ...}`。\
 没有请求体时填 `null`。
-9. `request_query` 是查询参数的**扁平对象**（如 `{"page": 1}`），\
-不是 OpenAPI 的 `parameters` 数组；`request_headers` 只放必要的非凭证头\
-（如 `Content-Type`）。
-10. 请求体**只能包含 schema 里声明过的字段**，不要添加 `id`、`created_at` \
+10. **查询参数写在 `request_query_json`**，**请求头写在 `request_headers_json`**，\
+值都是 JSON 字符串；不要使用 `request_query` / `request_headers` 字段。\
+查询参数是扁平对象（如 `{"page": 1}`），不是 OpenAPI 的 `parameters` 数组；\
+请求头只放必要的非凭证头（如 `Content-Type`）。
+11. **路径参数写在 `path_params_json`**：路径模板里每个 `{变量}` 都必须有值，\
+例如 `/invoices/{invoice_id}` → `"{\"invoice_id\": \"inv-123\"}"`。\
+没有路径参数时填 `null`。**不要把 `{invoice_id}` 这样的模板原样留在请求里。**
+12. 请求体**只能包含 schema 里声明过的字段**，不要添加 `id`、`created_at` \
 之类的服务端字段。
 
 ## 断言类型

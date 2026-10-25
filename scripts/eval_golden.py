@@ -243,6 +243,8 @@ async def evaluate_generation(
                 responses_schema=operation.responses_schema,
                 requested=dimensions,
                 result=result,
+                operation_path=operation.path,
+                request_body_schema=operation.request_body_schema,
             )
 
             low_expected = set(annotation.get("low_confidence_dimensions") or [])

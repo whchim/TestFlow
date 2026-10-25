@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -29,7 +30,11 @@ from typing import Any
 
 from jsonpath_ng.ext import parse as parse_jsonpath
 
-from testflow.agents.dimensions import declared_client_error_codes
+from testflow.agents.dimensions import (
+    boundary_target,
+    declared_client_error_codes,
+    json_body_schema,
+)
 from testflow.domain.cases import DimensionSpec, GeneratedCase, GenerationResult
 
 __all__ = [
@@ -76,9 +81,17 @@ def validate_generation(
     responses_schema: dict[str, Any] | None,
     requested: Sequence[DimensionSpec],
     result: GenerationResult,
+    operation_path: str = "",
+    request_body_schema: dict[str, Any] | None = None,
 ) -> ValidationResult:
     """跑完 L1 + L2，返回全部问题（不是首个）。"""
-    issues = [*_validate_l1(requested, result), *_validate_l2(responses_schema, requested, result)]
+    issues = [
+        *_validate_l1(requested, result),
+        *_validate_l2(responses_schema, requested, result),
+        *_validate_path_params(operation_path, result),
+        *_validate_schema_refs(responses_schema, result),
+        *_validate_boundary_values(request_body_schema, result),
+    ]
     return ValidationResult(tuple(issues))
 
 
@@ -232,6 +245,149 @@ def _assertion_issues(
                         dimension=case.dimension,
                     )
                 )
+    return issues
+
+
+def _validate_path_params(operation_path: str, result: GenerationResult) -> list[ValidationIssue]:
+    """路径模板里的每个 `{变量}` 都必须有实际取值。
+
+    只写 `/invoices/{invoice_id}` 的请求是**不可执行**的：它会被原样发出去，
+    既验证不了有效资源，也验证不了 `not_found`。这是 M5 人工标注时发现的
+    系统性问题——用例模型原本没有承载路径参数的字段。
+    """
+    placeholders = re.findall(r"\{([^{}]+)\}", operation_path or "")
+    if not placeholders:
+        return []
+
+    issues: list[ValidationIssue] = []
+    for index, case in enumerate(result.cases):
+        params = case.path_params or {}
+        missing = [
+            name
+            for name in placeholders
+            if not isinstance(params.get(name), str) or not params.get(name, "").strip()
+        ]
+        if missing:
+            issues.append(
+                ValidationIssue(
+                    layer=IssueLayer.L1,
+                    code="l1.path_param_missing",
+                    message=(
+                        f"第 {index + 1} 条用例缺少路径参数 "
+                        f"{', '.join(f'{{{name}}}' for name in missing)}；"
+                        "请求路径不能保留模板占位符"
+                    ),
+                    dimension=case.dimension,
+                    case_index=index,
+                )
+            )
+    return issues
+
+
+def _validate_schema_refs(
+    responses_schema: dict[str, Any] | None, result: GenerationResult
+) -> list[ValidationIssue]:
+    """`schema_valid` 只能指向**声明了 content schema** 的状态码。
+
+    接口声明了 `201` 但只写了 `description`、没有任何响应体结构时，
+    对它做整体结构校验没有依据——它一定无法求值。M5 人工标注里这类
+    断言占了错误用例的很大一部分。
+    """
+    issues: list[ValidationIssue] = []
+    for index, case in enumerate(result.cases):
+        for assertion in case.assertions:
+            if assertion.type != "schema_valid":
+                continue
+            ref = str(getattr(assertion, "schema_ref", ""))
+            if not _response_has_content_schema(responses_schema, ref):
+                issues.append(
+                    ValidationIssue(
+                        layer=IssueLayer.L1,
+                        code="l1.schema_valid_without_schema",
+                        message=(
+                            f"第 {index + 1} 条用例对状态码 {ref} 用了 schema_valid，"
+                            "但 Spec 没有为该响应声明 content schema"
+                        ),
+                        dimension=case.dimension,
+                        case_index=index,
+                    )
+                )
+    return issues
+
+
+def _response_has_content_schema(responses_schema: dict[str, Any] | None, status: str) -> bool:
+    if not isinstance(responses_schema, dict):
+        return False
+    response = responses_schema.get(status)
+    if response is None and status.isdigit():
+        # OpenAPI 的 responses 键通常是字符串，但调用方也可能传 int 键。
+        response = next(
+            (value for key, value in responses_schema.items() if str(key) == status),
+            None,
+        )
+    if not isinstance(response, dict):
+        return False
+    content = response.get("content")
+    if not isinstance(content, dict):
+        return False
+    return any(isinstance(media, dict) and "schema" in media for media in content.values())
+
+
+def _validate_boundary_values(
+    request_body_schema: dict[str, Any] | None, result: GenerationResult
+) -> list[ValidationIssue]:
+    """`boundary:*` 的取值必须**恰好**落在 Spec 给出的边界上。
+
+    M5 人工标注里有两类典型错误：`maxLength=280` 却给了 252 个字符；
+    `maximum=100` 且 `multipleOf=5` 却给了 101（同时违反两个约束，
+    无法单独验证最大值）。这两类都靠"模型自觉"不可靠，所以做成确定性校验。
+    """
+    body_schema = json_body_schema(request_body_schema) or {}
+    properties = body_schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+
+    issues: list[ValidationIssue] = []
+    for index, case in enumerate(result.cases):
+        parts = case.dimension.split(":")
+        if len(parts) != 3 or parts[0] != "boundary":
+            continue
+        field, tag = parts[1], parts[2]
+        field_schema = properties.get(field)
+        if not isinstance(field_schema, dict):
+            continue
+
+        expected = boundary_target(field_schema, tag)
+        if expected is None:
+            continue
+        kind, target = expected
+        value = (case.request_body or {}).get(field)
+
+        if kind == "length":
+            ok = isinstance(value, str) and len(value) == target
+            actual = f"长度 {len(value)}" if isinstance(value, str) else "不是字符串"
+            wanted = f"长度 {target}"
+        else:
+            ok = (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and float(value) == float(target)
+            )
+            actual = f"取值 {value!r}"
+            wanted = f"取值 {target:g}"
+
+        if not ok:
+            issues.append(
+                ValidationIssue(
+                    layer=IssueLayer.L1,
+                    code="l1.boundary_value_mismatch",
+                    message=(
+                        f"第 {index + 1} 条用例的 `{case.dimension}` 要求{wanted}，实际是{actual}"
+                    ),
+                    dimension=case.dimension,
+                    case_index=index,
+                )
+            )
     return issues
 
 

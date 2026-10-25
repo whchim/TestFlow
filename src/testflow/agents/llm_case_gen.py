@@ -40,6 +40,7 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from testflow.agents.dimensions import boundary_target, json_body_schema
 from testflow.agents.prompts import build_generation_prompt
 from testflow.agents.spec_context import SpecContext
 from testflow.agents.validation import feedback_text, validate_generation
@@ -48,7 +49,12 @@ from testflow.llm.client import LLMClient, LLMContentError, LLMError
 from testflow.observability.logging import get_logger
 from testflow.storage.models import Operation
 
-__all__ = ["LlmCaseGenerator", "materialize_request_bodies", "repair_free_form_keys"]
+__all__ = [
+    "LlmCaseGenerator",
+    "materialize_request_fields",
+    "repair_boundary_values",
+    "repair_free_form_keys",
+]
 
 logger = get_logger(__name__)
 
@@ -142,7 +148,7 @@ class LlmCaseGenerator:
                 result = await self._llm.generate(prompt=prompt, schema=GenerationResult)
                 # 请求体走"JSON 字符串"通道再解析：直接让模型输出自由格式
                 # 对象时，Qwen 3.7 Flash 会退化成带前导冒号的键（实测）。
-                result = materialize_request_bodies(result)
+                result = materialize_request_fields(result)
             except LLMContentError as exc:
                 last_content_error = exc
                 if attempt == self._max_retries:
@@ -156,12 +162,17 @@ class LlmCaseGenerator:
 
             # 兼容旧路径 / 假 Provider：它们仍然直接填 request_body。
             result = repair_free_form_keys(result)
+            # 边界值是**数学上唯一正确**的：模型算错时直接改对，而不是
+            # 让整条用例失败或带着错误取值进入执行。
+            result = repair_boundary_values(result, operation.request_body_schema)
 
             last_case_count = len(result.cases)
             last_issues = validate_generation(
                 responses_schema=operation.responses_schema,
                 requested=dimensions,
                 result=result,
+                operation_path=operation.path,
+                request_body_schema=operation.request_body_schema,
             )
             if last_issues.ok:
                 return result
@@ -180,48 +191,156 @@ class LlmCaseGenerator:
         )
 
 
-def materialize_request_bodies(result: GenerationResult) -> GenerationResult:
-    """把模型写的 `request_body_json` 解析成 `request_body`。
+def materialize_request_fields(result: GenerationResult) -> GenerationResult:
+    """把模型写的 `*_json` 字符串字段解析成对应的对象字段。
 
-    ## 为什么请求体要走"字符串"通道
+    ## 为什么请求字段要走"字符串"通道
 
-    `request_body` 是 `dict[str, Any]`，JSON Schema 只能声明"对象"，
-    无法声明键名。实测 Qwen 3.7 Flash 在这种自由格式对象上会退化成
-    **不合法的 JSON 片段**（键名前多出冒号、甚至出现空键），
-    SDK 的宽松解析会把它变成 `{': email': ...}` 或 `{}`。
+    `request_body` / `request_query` / `request_headers` 是自由格式对象，
+    JSON Schema 只能声明"这是一个对象"，无法约束键名。实测 Qwen 3.7 Flash
+    在这种结构上会退化成**不合法的 JSON 片段**（键名前多出冒号、空键，
+    甚至把兄弟字段写进对象里），SDK 的宽松解析会得到
+    `{': email': ...}`、`{}` 或把 `assertions` 塞进 `request_query`。
 
-    改成让模型输出一个 **JSON 字符串**后，结构化输出只需要处理字符串，
-    不再碰自由格式对象；平台再用 `json.loads` 解析并校验。
-    解析失败会抛 `LLMContentError`，走既有的"带反馈重试"路径——
-    **不会把一条坏请求静默落库**。
+    改成让模型输出 **JSON 字符串**后，结构化输出只需要处理字符串；
+    平台再用 `json.loads` 解析并校验。解析失败会抛 `LLMContentError`，
+    走既有的"带反馈重试"路径——**不会把一条坏请求静默落库**。
 
     Raises:
-        LLMContentError: 字符串不是合法 JSON，或解析结果不是对象。
+        LLMContentError: 字符串不是合法 JSON、解析结果不是对象，
+            或头/路径参数的值不是字符串。
     """
     changed = False
     cases = []
     for case in result.cases:
-        raw = case.request_body_json
-        if raw is None or not str(raw).strip():
+        updates: dict[str, Any] = {}
+
+        body = _parse_json_object(case.request_body_json, "request_body_json", case.dimension)
+        if body is not None:
+            updates["request_body"] = body
+            updates["request_body_json"] = None
+
+        query = _parse_json_object(case.request_query_json, "request_query_json", case.dimension)
+        if query is not None:
+            updates["request_query"] = query
+            updates["request_query_json"] = None
+
+        headers = _parse_json_object(
+            case.request_headers_json,
+            "request_headers_json",
+            case.dimension,
+            string_values=True,
+        )
+        if headers is not None:
+            updates["request_headers"] = headers
+            updates["request_headers_json"] = None
+
+        path_params = _parse_json_object(
+            case.path_params_json,
+            "path_params_json",
+            case.dimension,
+            string_values=True,
+        )
+        if path_params is not None:
+            updates["path_params"] = path_params
+            updates["path_params_json"] = None
+
+        if updates:
+            case = case.model_copy(update=updates)
+            changed = True
+        cases.append(case)
+
+    return result.model_copy(update={"cases": cases}) if changed else result
+
+
+def _parse_json_object(
+    raw: str | None,
+    field_name: str,
+    dimension: str,
+    *,
+    string_values: bool = False,
+) -> dict[str, Any] | None:
+    if raw is None or not str(raw).strip():
+        return None
+
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise LLMContentError(f"{field_name} 不是合法 JSON（{dimension}）：{exc}") from exc
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise LLMContentError(
+            f"{field_name} 解析后必须是 JSON 对象，收到 {type(value).__name__}（{dimension}）"
+        )
+    if string_values:
+        for key, item in value.items():
+            if not isinstance(key, str) or not isinstance(item, str):
+                raise LLMContentError(
+                    f"{field_name} 的键和值必须是字符串（{dimension}），"
+                    f"收到 {key!r}: {type(item).__name__}"
+                )
+    return value
+
+
+def repair_boundary_values(
+    result: GenerationResult, request_body_schema: dict[str, Any] | None
+) -> GenerationResult:
+    """把 `boundary:*` 的取值改成 Spec 给出的**精确边界**。
+
+    边界值是数学上唯一正确的：`maxLength=280` 就是 280 个字符，
+    `max=100` 且 `multipleOf=5` 的越界值就是 105。模型经常给出
+    254/255 或 101（同时违反两个约束），而"算错一个数字"不该让整条
+    用例失败，也不该让它带着错误取值进入执行。
+
+    这里做的是**确定性修正**，与 `repair_free_form_keys` 同一性质：
+    维度已经说明了"要测哪个边界"，取值由 Spec 唯一决定。
+    """
+    body_schema = json_body_schema(request_body_schema) or {}
+    properties = body_schema.get("properties")
+    if not isinstance(properties, dict):
+        return result
+
+    repaired = 0
+    cases = []
+    for case in result.cases:
+        parts = case.dimension.split(":")
+        if len(parts) != 3 or parts[0] != "boundary":
+            cases.append(case)
+            continue
+        field, tag = parts[1], parts[2]
+        field_schema = properties.get(field)
+        if not isinstance(field_schema, dict):
             cases.append(case)
             continue
 
-        try:
-            body = json.loads(raw)
-        except (TypeError, ValueError) as exc:
-            raise LLMContentError(
-                f"request_body_json 不是合法 JSON（{case.dimension}）：{exc}"
-            ) from exc
-        if not isinstance(body, dict):
-            raise LLMContentError(
-                f"request_body_json 解析后必须是 JSON 对象，收到 {type(body).__name__}"
-                f"（{case.dimension}）"
+        target = boundary_target(field_schema, tag)
+        if target is None:
+            cases.append(case)
+            continue
+
+        kind, number = target
+        body = dict(case.request_body or {})
+        if kind == "length":
+            length = int(number)
+            current = body.get(field)
+            value: Any = (
+                current[:length].ljust(length, "a") if isinstance(current, str) else "a" * length
             )
+        else:
+            value = int(number) if field_schema.get("type") == "integer" else number
 
-        cases.append(case.model_copy(update={"request_body": body, "request_body_json": None}))
-        changed = True
+        if body.get(field) != value:
+            body[field] = value
+            case = case.model_copy(update={"request_body": body})
+            repaired += 1
+        cases.append(case)
 
-    return result.model_copy(update={"cases": cases}) if changed else result
+    if repaired:
+        logger.warning("修复了 %d 条用例的边界取值（按 Spec 的精确边界）", repaired)
+        return result.model_copy(update={"cases": cases})
+    return result
 
 
 def repair_free_form_keys(result: GenerationResult) -> GenerationResult:

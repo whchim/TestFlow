@@ -64,11 +64,37 @@ class GeneratedCase(BaseModel):
         default=None,
         description='查询参数的扁平 JSON 对象，如 {"page": 1}；不是 OpenAPI 的 parameters 数组。',
     )
+    request_query_json: str | None = Field(
+        default=None,
+        description=(
+            "**优先使用这个字段**：把查询参数序列化成 JSON 字符串，"
+            '如 "{\\"page\\": 1}"。平台会解析成对象。没有查询参数时为 null。'
+        ),
+    )
     #: **不含凭证**（SR-6）。这不是靠"记得别放"保证的——凭证根本不在会被
     #: 序列化给 LLM 的对象里，执行时才由 Worker 按 host 注入（TE4）。
     request_headers: dict[str, str] | None = Field(
         default=None,
         description="只放必要的非凭证请求头（如 Content-Type）；不要放 Authorization。",
+    )
+    request_headers_json: str | None = Field(
+        default=None,
+        description=(
+            "**优先使用这个字段**：把请求头序列化成 JSON 字符串，"
+            '如 "{\\"Content-Type\\": \\"application/json\\"}"。'
+            "没有额外请求头时为 null。"
+        ),
+    )
+    path_params: dict[str, str] | None = Field(
+        default=None,
+        description='路径模板变量的取值，如 {invoice_id: "inv_123"}。',
+    )
+    path_params_json: str | None = Field(
+        default=None,
+        description=(
+            "**优先使用这个字段**：把路径参数序列化成 JSON 字符串。"
+            "路径里每个 {变量} 都必须有值；没有路径参数时为 null。"
+        ),
     )
     request_body: dict[str, Any] | None = Field(
         default=None,

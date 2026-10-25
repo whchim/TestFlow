@@ -152,6 +152,20 @@ class RuleBasedGenerator:
         )
 
 
+def _substitute_path(path: str, params: dict[str, str] | None) -> str:
+    """把 `/invoices/{invoice_id}` 替换成实际路径。
+
+    路径参数是**每条用例自己的取值**（`value_valid` 用一个存在的 ID，
+    `not_found` 用一个不存在的 ID），所以替换发生在用例层，而不是
+    Operation 层。L1 已经保证模板里的每个变量都有值；这里只做替换，
+    不再判断——把判断放在两处会让两边迟早不一致。
+    """
+    result = path
+    for name, value in (params or {}).items():
+        result = result.replace("{" + name + "}", str(value))
+    return result
+
+
 def _to_payload(
     case: GeneratedCase,
     operation: Operation,
@@ -165,7 +179,7 @@ def _to_payload(
         category=case.category,
         dimension=case.dimension,
         request_method=operation.method,
-        request_path=operation.path,
+        request_path=_substitute_path(operation.path, case.path_params),
         request_query=case.request_query,
         request_headers={k.lower(): v for k, v in (case.request_headers or {}).items()} or None,
         request_body=case.request_body,

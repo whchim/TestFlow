@@ -215,21 +215,39 @@ class GenerationResult(BaseModel):
     cases: list[GeneratedCase]
 ```
 
-### 4.4 请求体为什么走"JSON 字符串"通道
+### 4.4 请求字段为什么走"JSON 字符串"通道
 
-`request_body` 是自由格式对象，JSON Schema 只能声明"这是一个对象"，无法约束键名。
-M5 之后做人工标注时实测：Qwen 3.7 Flash 在长提示词下会把它写成不合法的 JSON 片段
-（键名前多出冒号 `': email'`，甚至出现空键），SDK 的宽松解析会得到
-`{': email': ...}` 或 `{}`。
+`request_body` / `request_query` / `request_headers` 是自由格式对象，JSON Schema
+只能声明"这是一个对象"，无法约束键名。M5 之后做人工标注时实测：Qwen 3.7 Flash
+在长提示词下会把它写成不合法的 JSON 片段（键名前多出冒号 `': email'`、空键，
+甚至把 `assertions` 写进 `request_query`），SDK 的宽松解析会得到
+`{': email': ...}`、`{}` 或错位的字段。
 
-所以模型改为输出 `request_body_json`（一个 JSON **字符串**），平台用 `json.loads`
-解析并校验：
+所以模型改为输出三个 JSON **字符串**字段：
+
+| 字符串字段 | 解析成 | 额外校验 |
+| :--- | :--- | :--- |
+| `request_body_json` | `request_body` | 必须是 JSON 对象 |
+| `request_query_json` | `request_query` | 必须是 JSON 对象 |
+| `request_headers_json` | `request_headers` | 键和值都必须是字符串 |
+| `path_params_json` | `path_params` | 键和值都必须是字符串；路径里每个 `{变量}` 都要有 |
+
+平台用 `json.loads` 解析并校验：
 
 - 解析失败 → `LLMContentError` → 走既有的带反馈重试
-- 解析结果不是对象 → 同样失败
-- 兼容旧路径：假 Provider 与历史输出仍然直接填 `request_body`
+- 兼容旧路径：假 Provider 与历史输出仍然直接填对应的 dict 字段
 
-这条修复的回归测试在 `tests/unit/test_free_form_repair.py`。
+### 4.5 边界值做确定性修正
+
+`boundary:*` 的取值由 Spec 唯一决定：`maxLength=280` 就是 280 个字符，
+`max=100` 且 `multipleOf=5` 的越界值是 105。模型经常算成 254 或 101，
+所以生成侧直接按 `boundary_target()` 修正，再用 L1 校验兜底。
+
+同理，路径参数在落库前**替换进 `request_path`**——`/invoices/{invoice_id}`
+不再以模板形式进入执行层。
+
+这些修复的回归测试在 `tests/unit/test_free_form_repair.py` 与
+`tests/unit/test_boundary_repair.py`。
 
 ### 4.2 Schema 生成方式
 
@@ -265,6 +283,9 @@ M5 之后做人工标注时实测：Qwen 3.7 Flash 在长提示词下会把它�
 | A2–A4 约束（§3.2） | 重试 |
 | `cases` 非空 | 重试 |
 | `dimension` 必须在阶段 A 的清单中，或标记为 `inferred` | 重试 |
+| 路径模板里的每个 `{变量}` 都有取值（`l1.path_param_missing`） | 重试 |
+| `schema_valid` 指向的状态码声明了 content schema（`l1.schema_valid_without_schema`） | 重试 |
+| `boundary:*` 的取值恰好落在 Spec 的边界上（`l1.boundary_value_mismatch`） | 确定性修正；修正后仍不符才重试 |
 
 > **为什么服务端已有 Schema 约束还要客户端再校验**：Schema 保证的是**结构**合法，不保证**业务语义**正确（`02` §5.2）。`status_code: 999` 结构完全合法，但毫无意义。这一层不能省。
 

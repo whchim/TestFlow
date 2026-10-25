@@ -169,6 +169,9 @@ async def _generate(args: argparse.Namespace) -> int:
         used_ids: set[str] = set()
         cases_payload: list[dict[str, Any]] = []
         for case in result.cases:
+            request_path = operation.path
+            for name, value in (case.path_params or {}).items():
+                request_path = request_path.replace("{" + name + "}", str(value))
             cases_payload.append(
                 {
                     "id": _case_id(operation, case.dimension, used_ids),
@@ -177,7 +180,8 @@ async def _generate(args: argparse.Namespace) -> int:
                     "category": case.category,
                     "request": {
                         "method": operation.method,
-                        "path": operation.path,
+                        "path": request_path,
+                        "path_params": case.path_params,
                         "query": case.request_query,
                         "headers": case.request_headers,
                         "body": case.request_body,
@@ -235,18 +239,27 @@ async def _generate(args: argparse.Namespace) -> int:
     )
 
     print(
-        f"\n共 {total_cases} 条用例，写入 {out_path.relative_to(ROOT)}\n"
+        f"\n共 {total_cases} 条用例，写入 {_display_path(out_path)}\n"
         f"调用 {len(records)} 次，成本 {'未知' if cost is None else f'￥{cost:.6f}'}"
     )
     if failures:
         print(f"⚠️  {len(failures)} 个接口生成失败，见文件末尾的 generation_failures。")
-    print(f"\n下一步：编辑 {out_path.relative_to(ROOT)}，填写 verdict，然后运行")
+    print(f"\n下一步：编辑 {_display_path(out_path)}，填写 verdict，然后运行")
     print("  uv run python scripts/label_cases.py score")
     return 0 if not failures else 1
 
 
 def _pct(value: float | None) -> str:
     return "—" if value is None else f"{value:.1%}"
+
+
+def _display_path(path: Path) -> str:
+    """仓库内显示相对路径；外部文件（例如别人标注后放到别的目录）显示绝对路径。"""
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(ROOT))
+    except ValueError:
+        return str(resolved)
 
 
 def _score(args: argparse.Namespace) -> int:
@@ -305,7 +318,7 @@ def _score(args: argparse.Namespace) -> int:
     payload = {
         "schema_version": 1,
         "created_at": datetime.now(UTC).isoformat(),
-        "sheet": str(sheet_path.relative_to(ROOT)),
+        "sheet": _display_path(sheet_path),
         "model": sheet.get("model"),
         "golden_set_sha256": sheet.get("golden_set_sha256"),
         **score.as_dict(),
@@ -317,7 +330,7 @@ def _score(args: argparse.Namespace) -> int:
         out_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        print(f"\n结果已写入 {out_path.relative_to(ROOT)}")
+        print(f"\n结果已写入 {_display_path(out_path)}")
     return 0
 
 

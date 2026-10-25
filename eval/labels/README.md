@@ -52,6 +52,37 @@ SDK 的宽松解析把它变成 `{': email': ...}` 或 `{}`。
 相关代码在 `agents/llm_case_gen.py::materialize_request_bodies`，
 回归测试在 `tests/unit/test_free_form_repair.py`。
 
+## 首轮基线（2026-10-25）
+
+`golden-set-cases-labeled.yaml` 是第一轮的标注结果：
+
+| 指标 | 值 |
+| :--- | ---: |
+| 用例准确率 | **47.2%**（17 正确 / 19 错误） |
+| 断言准确率 | **78.3%** |
+| 跳过 | 3 条（Spec 信息不足） |
+
+> ⚠️ 这一轮由 **GPT 独立标注**，不是人工逐条复核。它比"生成方自己打分"可靠
+> （不同模型、不同提示词），但严格来说仍是 **LLM-as-judge**。写进简历或文档时
+> 应当说明来源；需要更强结论时，抽检一部分即可。
+
+错误集中在三类**系统性缺陷**，而不是随机波动：
+
+1. **路径参数没有取值**：`/invoices/{invoice_id}` 原样保留模板占位符（7 条）
+2. **`schema_valid` 指向没有响应体 schema 的状态码**（8 条）
+3. **请求结构损坏**：查询参数/请求头里混进了兄弟字段（`/reports/summary`、
+   `/devices`）
+
+这三类已修复：
+
+- `GeneratedCase` 增加 `path_params_json`，执行前替换模板；L1 校验每个
+  `{变量}` 都有值
+- L1 新增 `schema_valid_without_schema`：Spec 没声明 content schema 时禁止该断言
+- 查询参数与请求头也改走 JSON 字符串通道（与 `request_body_json` 同一机制）
+- 边界值增加确定性修正：`maxLength=280` 就是 280 字符；`max=100` +
+  `multipleOf=5` 的越界值是 105
+- 修复后重新生成 `golden-set-cases.yaml`，需要**第二轮标注**才能得到新数字
+
 ## 结果文件
 
 `score` 默认写入 `eval/results/<时间>-labels.json`，包含：
@@ -59,3 +90,5 @@ SDK 的宽松解析把它变成 `{': email': ...}` 或 `{}`。
 - 用例准确率、断言准确率
 - 按接口、按维度的拆解
 - 本次标注对应的 `golden_set_sha256` 与模型名
+
+首轮基线：`eval/results/20261025-085145-labels.json`。

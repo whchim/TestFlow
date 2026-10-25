@@ -10,13 +10,22 @@ from __future__ import annotations
 
 import pytest
 
-from testflow.agents.llm_case_gen import materialize_request_bodies, repair_free_form_keys
+from testflow.agents.llm_case_gen import materialize_request_fields, repair_free_form_keys
 from testflow.domain.assertions import StatusCodeAssertion
 from testflow.domain.cases import GeneratedCase, GenerationResult
 from testflow.llm.client import LLMContentError
 
 
-def _case(*, body=None, query=None, headers=None, body_json=None) -> GeneratedCase:
+def _case(
+    *,
+    body=None,
+    query=None,
+    headers=None,
+    body_json=None,
+    query_json=None,
+    headers_json=None,
+    path_json=None,
+) -> GeneratedCase:
     return GeneratedCase(
         dimension="value_valid",
         name="POST /users",
@@ -24,7 +33,10 @@ def _case(*, body=None, query=None, headers=None, body_json=None) -> GeneratedCa
         request_body=body,
         request_body_json=body_json,
         request_query=query,
+        request_query_json=query_json,
         request_headers=headers,
+        request_headers_json=headers_json,
+        path_params_json=path_json,
         assertions=[
             StatusCodeAssertion(type="status_code", expected=201, derived_from="spec"),
         ],
@@ -94,7 +106,7 @@ def test_clean_body_is_returned_unchanged() -> None:
 
 
 def _materialize(case: GeneratedCase) -> GeneratedCase:
-    return materialize_request_bodies(GenerationResult(cases=[case])).cases[0]
+    return materialize_request_fields(GenerationResult(cases=[case])).cases[0]
 
 
 def test_json_string_body_is_parsed_and_cleared() -> None:
@@ -124,3 +136,34 @@ def test_empty_json_string_leaves_the_dict_path_alone() -> None:
     fixed = _materialize(_case(body={"name": "Alice"}, body_json="   "))
 
     assert fixed.request_body == {"name": "Alice"}
+
+
+def test_query_and_headers_use_the_json_string_channel() -> None:
+    fixed = _materialize(
+        _case(
+            query_json='{"page": 2}',
+            headers_json='{"Content-Type": "application/json"}',
+        )
+    )
+
+    assert fixed.request_query == {"page": 2}
+    assert fixed.request_headers == {"Content-Type": "application/json"}
+    assert fixed.request_query_json is None
+    assert fixed.request_headers_json is None
+
+
+def test_path_params_use_the_json_string_channel() -> None:
+    fixed = _materialize(_case(path_json='{"invoice_id": "inv-123"}'))
+
+    assert fixed.path_params == {"invoice_id": "inv-123"}
+    assert fixed.path_params_json is None
+
+
+def test_header_values_must_be_strings() -> None:
+    with pytest.raises(LLMContentError, match="键和值必须是字符串"):
+        _materialize(_case(headers_json='{"Content-Type": 123}'))
+
+
+def test_query_json_must_be_an_object() -> None:
+    with pytest.raises(LLMContentError, match="必须是 JSON 对象"):
+        _materialize(_case(query_json="[1, 2]"))

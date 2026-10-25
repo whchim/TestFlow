@@ -21,11 +21,13 @@ def _case(
     *,
     derived_from: str = "spec",
     assertions: list[dict[str, Any]] | None = None,
+    path_params: dict[str, str] | None = None,
 ) -> GeneratedCase:
     return GeneratedCase(
         dimension=dim,
         name=dim,
         category="normal",
+        path_params=path_params,
         assertions=assertions
         if assertions is not None
         else [{"type": "status_code", "expected": 200, "derived_from": "spec"}],
@@ -33,12 +35,20 @@ def _case(
     )
 
 
-def _validate(cases, *, requested, responses=None):
+def _validate(cases, *, requested, responses=None, operation_path="", request_body=None):
     return validate_generation(
         responses_schema=responses or {"200": {}},
         requested=requested,
         result=GenerationResult(cases=cases),
+        operation_path=operation_path,
+        request_body_schema=request_body,
     )
+
+
+def _body(properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "content": {"application/json": {"schema": {"type": "object", "properties": properties}}}
+    }
 
 
 def _codes(result) -> list[str]:
@@ -64,6 +74,121 @@ def test_duplicate_dimension_is_reported() -> None:
         requested=[_dim("value_valid")],
     )
     assert "l1.dimension_duplicate" in _codes(result)
+
+
+def test_missing_path_parameter_is_reported() -> None:
+    result = _validate(
+        [_case("value_valid")],
+        requested=[_dim("value_valid")],
+        operation_path="/items/{item_id}",
+    )
+
+    assert "l1.path_param_missing" in _codes(result)
+
+
+def test_provided_path_parameter_is_accepted() -> None:
+    result = _validate(
+        [_case("value_valid", path_params={"item_id": "item-42"})],
+        requested=[_dim("value_valid")],
+        operation_path="/items/{item_id}",
+    )
+
+    assert "l1.path_param_missing" not in _codes(result)
+
+
+def test_schema_valid_without_a_response_schema_is_reported() -> None:
+    result = _validate(
+        [
+            _case(
+                "value_valid",
+                assertions=[{"type": "schema_valid", "schema_ref": "201", "derived_from": "spec"}],
+            )
+        ],
+        requested=[_dim("value_valid", status=201)],
+        responses={"201": {"description": "创建成功"}},
+    )
+
+    assert "l1.schema_valid_without_schema" in _codes(result)
+
+
+def test_schema_valid_with_a_declared_schema_is_accepted() -> None:
+    result = _validate(
+        [
+            _case(
+                "value_valid",
+                assertions=[{"type": "schema_valid", "schema_ref": "201", "derived_from": "spec"}],
+            )
+        ],
+        requested=[_dim("value_valid", status=201)],
+        responses={
+            "201": {
+                "description": "创建成功",
+                "content": {"application/json": {"schema": {"type": "object"}}},
+            }
+        },
+    )
+
+    assert "l1.schema_valid_without_schema" not in _codes(result)
+
+
+def _boundary_case(dimension: str, field: str, value: Any) -> GeneratedCase:
+    return GeneratedCase(
+        dimension=dimension,
+        name=dimension,
+        category="boundary",
+        request_body={field: value},
+        assertions=[{"type": "status_code", "expected": 201, "derived_from": "spec"}],
+        derived_from="spec",
+    )
+
+
+def test_len_max_must_match_max_length_exactly() -> None:
+    schema = _body({"bio": {"type": "string", "minLength": 1, "maxLength": 280}})
+    dim = _dim("boundary:bio:len_max", status=201)
+
+    bad = _validate(
+        [_boundary_case("boundary:bio:len_max", "bio", "a" * 254)],
+        requested=[dim],
+        request_body=schema,
+    )
+    good = _validate(
+        [_boundary_case("boundary:bio:len_max", "bio", "a" * 280)],
+        requested=[dim],
+        request_body=schema,
+    )
+
+    assert "l1.boundary_value_mismatch" in _codes(bad)
+    assert "l1.boundary_value_mismatch" not in _codes(good)
+
+
+def test_max_over_must_respect_multiple_of() -> None:
+    schema = _body({"quantity": {"type": "integer", "maximum": 100, "multipleOf": 5}})
+    dim = _dim("boundary:quantity:max_over", status=400)
+
+    bad = _validate(
+        [_boundary_case("boundary:quantity:max_over", "quantity", 101)],
+        requested=[dim],
+        request_body=schema,
+    )
+    good = _validate(
+        [_boundary_case("boundary:quantity:max_over", "quantity", 105)],
+        requested=[dim],
+        request_body=schema,
+    )
+
+    assert "l1.boundary_value_mismatch" in _codes(bad)
+    assert "l1.boundary_value_mismatch" not in _codes(good)
+
+
+def test_non_boundary_dimensions_are_ignored_by_the_boundary_check() -> None:
+    schema = _body({"bio": {"type": "string", "maxLength": 280}})
+    result = _validate(
+        [_case("value_valid")],
+        requested=[_dim("value_valid")],
+        request_body=schema,
+    )
+
+    assert "l1.boundary_value_mismatch" not in _codes(result)
 
 
 def test_extra_inferred_dimension_within_limit_is_allowed() -> None:

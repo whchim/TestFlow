@@ -34,7 +34,12 @@ from typing import Any
 
 from testflow.domain.cases import DimensionSpec
 
-__all__ = ["derive_dimensions", "is_pure_rule_operation", "json_body_schema"]
+__all__ = [
+    "boundary_target",
+    "derive_dimensions",
+    "is_pure_rule_operation",
+    "json_body_schema",
+]
 
 #: `boundary` 维度展开成两条：边界值本身（应当被接受）与越界值（应当被拒绝）。
 #:
@@ -118,6 +123,44 @@ def declared_client_error_codes(responses_schema: dict[str, Any] | None) -> list
         if len(text) == 3 and text.startswith("4") and text.isdigit():
             codes.append(int(text))
     return sorted(set(codes))
+
+
+def boundary_target(field_schema: dict[str, Any], tag: str) -> tuple[str, float] | None:
+    """按 `boundary:<field>:<tag>` 算出**唯一正确**的长度或取值。
+
+    返回 `(kind, target)`：`kind` 是 `length` 或 `value`。
+    无法判断（字段缺对应约束、tag 不认识）时返回 `None`。
+
+    这个函数同时被两处使用：
+
+    * `validation.py` —— 校验模型给的取值是否恰好落在边界上
+    * `llm_case_gen.repair_boundary_values` —— 把算错的边界值改成正确值
+
+    放在 `dimensions.py` 而不是任一调用方：边界语义属于"阶段 A 的维度定义"，
+    两边各写一份迟早会不一致。
+    """
+    if tag in {"len_min", "len_min_over", "len_max", "len_max_over"}:
+        key = "minLength" if tag.startswith("len_min") else "maxLength"
+        base = field_schema.get(key)
+        if not isinstance(base, int) or isinstance(base, bool):
+            return None
+        if tag.endswith("_over"):
+            base = base - 1 if tag.startswith("len_min") else base + 1
+        return ("length", float(base))
+
+    if tag in {"min", "min_over", "max", "max_over"}:
+        key = "minimum" if tag.startswith("min") else "maximum"
+        base = field_schema.get(key)
+        if not isinstance(base, (int, float)) or isinstance(base, bool):
+            return None
+        step = field_schema.get("multipleOf")
+        if not isinstance(step, (int, float)) or isinstance(step, bool) or step <= 0:
+            step = 1
+        if tag.endswith("_over"):
+            base = base - step if tag.startswith("min") else base + step
+        return ("value", float(base))
+
+    return None
 
 
 def derive_dimensions(

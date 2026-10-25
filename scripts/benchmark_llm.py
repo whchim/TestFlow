@@ -198,6 +198,8 @@ async def _run_grid(args: argparse.Namespace) -> int:
                     responses_schema=op.responses_schema,
                     requested=dimensions,
                     result=result,
+                    operation_path=op.path,
+                    request_body_schema=op.request_body_schema,
                 ).ok:
                     passes += 1
 
