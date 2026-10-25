@@ -60,11 +60,33 @@ class GeneratedCase(BaseModel):
     name: str
     category: CaseCategory
 
-    request_query: dict[str, Any] | None = None
+    request_query: dict[str, Any] | None = Field(
+        default=None,
+        description='查询参数的扁平 JSON 对象，如 {"page": 1}；不是 OpenAPI 的 parameters 数组。',
+    )
     #: **不含凭证**（SR-6）。这不是靠"记得别放"保证的——凭证根本不在会被
     #: 序列化给 LLM 的对象里，执行时才由 Worker 按 host 注入（TE4）。
-    request_headers: dict[str, str] | None = None
-    request_body: dict[str, Any] | None = None
+    request_headers: dict[str, str] | None = Field(
+        default=None,
+        description="只放必要的非凭证请求头（如 Content-Type）；不要放 Authorization。",
+    )
+    request_body: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            '要发送的 JSON 对象本身，如 {"name": "Alice", "age": 30}。'
+            "必须是合法 JSON（键和字符串都用双引号），不要输出 YAML；"
+            '不要包成 {"content": ...}、{"type": ..., "value": ...} 或 {"body": ...}；'
+            "没有请求体时为 null。"
+        ),
+    )
+    request_body_json: str | None = Field(
+        default=None,
+        description=(
+            "**优先使用这个字段**：把请求体序列化成一个 JSON 字符串，"
+            '例如 "{\\"name\\": \\"Alice\\"}"。平台会解析成对象。'
+            "没有请求体时为 null。不要和 request_body 同时填。"
+        ),
+    )
 
     assertions: list[Assertion] = Field(min_length=1)
 

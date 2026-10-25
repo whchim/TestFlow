@@ -201,6 +201,9 @@ class GeneratedCase(BaseModel):
     request_query: dict[str, Any] | None = None
     request_headers: dict[str, str] | None = None  # 不含凭证，见 04 §2.5
     request_body: dict[str, Any] | None = None
+    #: **模型优先生成这个字段**：请求体的 JSON 字符串。
+    #: 解析后写入 `request_body` 并清空本字段（见 §4.4）。
+    request_body_json: str | None = None
     assertions: list[Assertion]  # 至少 1 条
     requires_auth: bool = True  # 置 False 时执行器不注入凭证（`TestExecutor.md` §5.2）
     derived_from: Literal["spec", "inferred"]
@@ -211,6 +214,22 @@ class GenerationResult(BaseModel):
     operation_notes: str | None = None  # 对该 Operation 的整体说明
     cases: list[GeneratedCase]
 ```
+
+### 4.4 请求体为什么走"JSON 字符串"通道
+
+`request_body` 是自由格式对象，JSON Schema 只能声明"这是一个对象"，无法约束键名。
+M5 之后做人工标注时实测：Qwen 3.7 Flash 在长提示词下会把它写成不合法的 JSON 片段
+（键名前多出冒号 `': email'`，甚至出现空键），SDK 的宽松解析会得到
+`{': email': ...}` 或 `{}`。
+
+所以模型改为输出 `request_body_json`（一个 JSON **字符串**），平台用 `json.loads`
+解析并校验：
+
+- 解析失败 → `LLMContentError` → 走既有的带反馈重试
+- 解析结果不是对象 → 同样失败
+- 兼容旧路径：假 Provider 与历史输出仍然直接填 `request_body`
+
+这条修复的回归测试在 `tests/unit/test_free_form_repair.py`。
 
 ### 4.2 Schema 生成方式
 
@@ -225,7 +244,7 @@ class GenerationResult(BaseModel):
 | 参数 | 取值 | 依据 |
 | :--- | :--- | :--- |
 | 调用粒度 | **逐 Operation** 一次调用 | TG4，见 §8 |
-| `enable_thinking` | 开启 | 边界场景需要推理 |
+| `enable_thinking` | **关闭** | M4 实测：开启时单次 P95 ≈ 57s、输出 token ×7、首次通过率反而更低（`02` §5.3） |
 | 流式 | 开启 | 思考模式强制要求（`02` §5.3） |
 | `result_format` | `message` | `02` §5.3 |
 | 采样参数 | 由 Eval 实测确定 | 不在此拍定 |

@@ -36,6 +36,7 @@ TG1（维度确定，取值生成）、TG4（逐 Operation）、`06-Agent编排.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -47,7 +48,7 @@ from testflow.llm.client import LLMClient, LLMContentError, LLMError
 from testflow.observability.logging import get_logger
 from testflow.storage.models import Operation
 
-__all__ = ["LlmCaseGenerator"]
+__all__ = ["LlmCaseGenerator", "materialize_request_bodies", "repair_free_form_keys"]
 
 logger = get_logger(__name__)
 
@@ -139,15 +140,22 @@ class LlmCaseGenerator:
             )
             try:
                 result = await self._llm.generate(prompt=prompt, schema=GenerationResult)
+                # 请求体走"JSON 字符串"通道再解析：直接让模型输出自由格式
+                # 对象时，Qwen 3.7 Flash 会退化成带前导冒号的键（实测）。
+                result = materialize_request_bodies(result)
             except LLMContentError as exc:
                 last_content_error = exc
                 if attempt == self._max_retries:
                     raise
                 feedback = (
-                    "上一次输出无法解析为 GenerationResult。"
-                    "请严格按给定的 JSON Schema 输出，不要附加任何解释性文字。"
+                    "上一次输出无法解析，或 request_body_json 不是合法 JSON。"
+                    "请严格按给定的 JSON Schema 输出；request_body_json 必须是"
+                    "一个合法的 JSON 对象字符串（键和字符串值都用双引号）。"
                 )
                 continue
+
+            # 兼容旧路径 / 假 Provider：它们仍然直接填 request_body。
+            result = repair_free_form_keys(result)
 
             last_case_count = len(result.cases)
             last_issues = validate_generation(
@@ -170,6 +178,117 @@ class LlmCaseGenerator:
             f"请求了 {len(dimensions)} 个维度，返回了 {last_case_count} 条用例。"
             "维度清单由阶段 A 从 Schema 派生，是**确定性的**——模型只负责填取值（TG1）。"
         )
+
+
+def materialize_request_bodies(result: GenerationResult) -> GenerationResult:
+    """把模型写的 `request_body_json` 解析成 `request_body`。
+
+    ## 为什么请求体要走"字符串"通道
+
+    `request_body` 是 `dict[str, Any]`，JSON Schema 只能声明"对象"，
+    无法声明键名。实测 Qwen 3.7 Flash 在这种自由格式对象上会退化成
+    **不合法的 JSON 片段**（键名前多出冒号、甚至出现空键），
+    SDK 的宽松解析会把它变成 `{': email': ...}` 或 `{}`。
+
+    改成让模型输出一个 **JSON 字符串**后，结构化输出只需要处理字符串，
+    不再碰自由格式对象；平台再用 `json.loads` 解析并校验。
+    解析失败会抛 `LLMContentError`，走既有的"带反馈重试"路径——
+    **不会把一条坏请求静默落库**。
+
+    Raises:
+        LLMContentError: 字符串不是合法 JSON，或解析结果不是对象。
+    """
+    changed = False
+    cases = []
+    for case in result.cases:
+        raw = case.request_body_json
+        if raw is None or not str(raw).strip():
+            cases.append(case)
+            continue
+
+        try:
+            body = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise LLMContentError(
+                f"request_body_json 不是合法 JSON（{case.dimension}）：{exc}"
+            ) from exc
+        if not isinstance(body, dict):
+            raise LLMContentError(
+                f"request_body_json 解析后必须是 JSON 对象，收到 {type(body).__name__}"
+                f"（{case.dimension}）"
+            )
+
+        cases.append(case.model_copy(update={"request_body": body, "request_body_json": None}))
+        changed = True
+
+    return result.model_copy(update={"cases": cases}) if changed else result
+
+
+def repair_free_form_keys(result: GenerationResult) -> GenerationResult:
+    """修复自由格式对象里**键名前导冒号**这一种退化。
+
+    ## 为什么需要它
+
+    `request_body` / `request_query` / `request_headers` 的类型是
+    `dict[str, Any]`——JSON Schema 只能声明"这是一个对象"，无法声明每个键。
+    Qwen 3.7 Flash 在长提示词 + 大量 `key:value` 形态的维度名（
+    `required_missing:email`）之后，偶尔会把对象键写成 `": email"`，
+    甚至产生空键 `": "`。**原始响应本身就是不合法的 JSON 片段**，
+    而 SDK 的宽松解析把它变成了带冒号的键。
+
+    这是**序列化层的退化，不是测试意图错误**：把键名清洗回 `email` 之后，
+    用例的取值与断言通常仍然是对的。所以在这里做一次确定性修复，
+    而不是让它把整条用例判成"生成失败"。
+
+    ## 边界
+
+    * 只清洗**键名**，不改值
+    * 递归处理嵌套对象（`billing` / `shipping` 这类）
+    * 清洗后为空的键直接丢弃——它承载不了任何信息
+    * 记录修复条数，便于观察这种退化的频率；**不静默**
+    """
+
+    repaired = 0
+    cases = []
+    for case in result.cases:
+        body = _clean_mapping(case.request_body)
+        query = _clean_mapping(case.request_query)
+        headers = _clean_mapping(case.request_headers)
+        if (body, query, headers) != (
+            case.request_body,
+            case.request_query,
+            case.request_headers,
+        ):
+            repaired += 1
+            case = case.model_copy(
+                update={"request_body": body, "request_query": query, "request_headers": headers}
+            )
+        cases.append(case)
+
+    if repaired:
+        logger.warning(
+            "修复了 %d 条用例的自由格式键名（模型输出带前导冒号）；"
+            "这是序列化层退化，不是测试意图错误",
+            repaired,
+        )
+        return result.model_copy(update={"cases": cases})
+    return result
+
+
+def _clean_mapping(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            while key.startswith(":"):
+                key = key[1:].strip()
+            if not key:
+                continue
+            cleaned[key] = _clean_mapping(raw_value)
+        return cleaned
+    if isinstance(value, list):
+        return [_clean_mapping(item) for item in value]
+    return value
 
 
 def _operation_payload(operation: Operation) -> dict[str, Any]:
