@@ -40,8 +40,15 @@ services:
       POSTGRES_DB: testflow
       TZ: UTC
     ports:
-      # ⚠️ 对 10 OP2 的细化，见下方注释块
-      - "127.0.0.1:5432:5432"
+      # ⚠️ 对 10 OP2 的细化，见下方注释块。
+      #
+      # 宿主机端口可配置：Windows 把 5422–5521 列为保留端口段，5432 正好
+      # 落在里面，绑定会报 "An attempt was made to access a socket in a way
+      # forbidden by its access permissions"。此时在 `.env` 里设
+      #   PG_HOST_PORT=55432
+      # 并把 TESTFLOW_DATABASE_URL 的端口改成 55432 即可——变量名**故意不带
+      # `TESTFLOW_` 前缀**，否则会被 Settings 的 `extra="forbid"` 当成未知配置。
+      - "127.0.0.1:${PG_HOST_PORT:-5432}:5432"
     volumes:
       # ⚠️ 挂载点是 /var/lib/postgresql，**不是** /var/lib/postgresql/data。
       # PostgreSQL 18 的官方镜像改了数据目录布局：改用按主版本分的子目录

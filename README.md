@@ -52,6 +52,11 @@ docker compose --profile tools run --rm migrate
 ./scripts/demo.sh
 ```
 
+> **Windows 提示**：系统保留端口段 5422–5521 包含 5432，Docker 可能无法绑定
+> 宿主机的 5432。此时把 postgres 映射到 55432（例如创建本地
+> `docker-compose.override.yml`，它已在 `.gitignore` 中），并同步修改
+> `.env` 里 `TESTFLOW_DATABASE_URL` 的端口。
+
 `scripts/demo.sh` 会走完整链路：上传 fixture 的 OpenAPI 文档 → 生成用例 →
 自动批准人工确认门 → 执行 → 归因 → 输出报告，并校验通过率、归因覆盖率、
 LLM 调用次数、缓存命中与成本。
