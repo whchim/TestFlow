@@ -83,6 +83,46 @@ SDK 的宽松解析把它变成 `{': email': ...}` 或 `{}`。
   `multipleOf=5` 的越界值是 105
 - 修复后重新生成 `golden-set-cases.yaml`，需要**第二轮标注**才能得到新数字
 
+## 第二轮结果（2026-10-26）
+
+`golden-set-cases-round2-labeled.yaml` 是修复后的第二轮标注：
+
+| 指标 | 第一轮（修复前） | 第二轮（修复后） |
+| :--- | ---: | ---: |
+| 用例准确率 | **47.2%**（17 / 36） | **85.2%**（23 / 27） |
+| 断言准确率 | **78.3%** | **91.7%** |
+| 跳过 | 3 | 12 |
+
+### 为什么跳过从 3 涨到 12
+
+不是生成变差了，而是**判据变严了**：第二轮用例开始对响应体做断言
+（`$.id`、`$.error`），而 Golden Set 的这些接口大多**没有声明响应体 schema**。
+独立标注只能判"Spec 支持"的事实，不能替 Spec 补答案，所以标 `skip`。
+
+这 12 条 skip 指向的是 **Golden Set 本身的信息不足**，不是生成器的错误：
+
+- `/orders`、`/users` 的 4xx 只写了 `description`，没有响应体结构
+- `/items`、`/orders` 的成功响应没有声明 `id`
+- `/health` 没有声明安全要求
+- `/devices` 的自定义 `format: imei` 没有定义具体校验规则
+- `/invoices` 的 409 没有说明如何构造冲突状态
+
+如果要让更多用例可判定，下一步应当**给 Golden Set 补响应 schema 与失败触发条件**，
+而不是放宽标注标准。
+
+### 剩下 4 条错误
+
+| 用例 | 原因 | 处理 |
+| :--- | :--- | :--- |
+| `/products` `boundary:quantity:min` | `quantity=1` 满足 `minimum=1`，但违反 `multipleOf=5` | 已修 `boundary_target`：最小合法值是 5 |
+| `/products` `boundary:quantity:min_over` | `-4` 同时违反 `minimum` 与 `multipleOf` | 已修：应为 0（小于 1 且是 5 的倍数） |
+| `/reports/summary` `value_valid` | `body_contains` 的 `text` 是空字符串，恒真 | 已加 L1 `assertion_empty_value` |
+| `/invoices` `status:400` | `invoice_id` 只声明为 string，没有格式约束，无法构造 400 | 开放问题：声明的错误码缺少触发条件 |
+
+前三条在第二轮之后已修复；第三条的同类问题还会被新的 L1 规则拦住。
+最后一条是"声明了错误码但没有说明怎么触发"的普遍问题，需要 Golden Set
+补充触发条件，或把这类维度标为低置信度。
+
 ## 结果文件
 
 `score` 默认写入 `eval/results/<时间>-labels.json`，包含：
@@ -91,4 +131,7 @@ SDK 的宽松解析把它变成 `{': email': ...}` 或 `{}`。
 - 按接口、按维度的拆解
 - 本次标注对应的 `golden_set_sha256` 与模型名
 
-首轮基线：`eval/results/20261025-085145-labels.json`。
+| 轮次 | 结果文件 |
+| :--- | :--- |
+| 第一轮（基线） | `eval/results/20261025-085145-labels.json` |
+| 第二轮（修复后） | `eval/results/20261026-024359-labels.json` |

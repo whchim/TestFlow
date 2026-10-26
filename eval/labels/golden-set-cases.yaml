@@ -1,15 +1,15 @@
 version: 1
-generated_at: '2026-10-25T09:03:24.082533+00:00'
+generated_at: '2026-10-26T02:53:53.329304+00:00'
 model: qwen3.7-flash
 golden_set_sha256: 929e062e3f9f61d31acab85d2ef9d92517e6a8451539489c82ee06c113a26911
 instructions: "对每一条用例填写 verdict：\n\n  correct   请求构造合理，断言与 Spec 一致，且能验证该维度\n  incorrect 请求取值、期望状态码或断言有错\n  skip      无法判断（例如\
   \ Spec 信息不足），请在 note 里说明\n  null      还没标\n\n准确率只统计 correct + incorrect，skip 与未标注都不进分母。\n如果还想单独统计断言准确率，可以填 assertion_verdicts：\n\
   与 assertions 等长的列表，元素是 correct / incorrect / null。\n"
 usage:
-  calls: 14
-  prompt_tokens: 20736
-  cached_tokens: 5120
-  cost_cny: '0.013428'
+  calls: 9
+  prompt_tokens: 13754
+  cached_tokens: 0
+  cost_cny: '0.009804'
 operations:
 - method: POST
   path: /accounts
@@ -42,7 +42,7 @@ operations:
   cases:
   - id: 'POST /accounts :: value_valid'
     dimension: value_valid
-    name: 正常创建账户
+    name: 正常路径：所有必填字段给合法值，验证正常路径
     category: normal
     request:
       method: POST
@@ -53,18 +53,13 @@ operations:
         Content-Type: application/json
       body:
         code: ABC
-        role: user
+        role: admin
     assertions:
     - type: status_code
       expected: 201
       derived_from: spec
-    - type: header
-      name: Content-Type
-      operator: eq
-      expected: application/json
-      derived_from: inferred
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -72,7 +67,7 @@ operations:
     note: ''
   - id: 'POST /accounts :: constraint_violation:code'
     dimension: constraint_violation:code
-    name: code违反pattern约束
+    name: 约束违反：code 违反 pattern 约束应当被拒绝
     category: abnormal
     request:
       method: POST
@@ -82,14 +77,14 @@ operations:
       headers:
         Content-Type: application/json
       body:
-        code: abc
-        role: user
+        code: a
+        role: admin
     assertions:
     - type: status_code
       expected: 422
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -97,7 +92,7 @@ operations:
     note: ''
   - id: 'POST /accounts :: constraint_violation:role'
     dimension: constraint_violation:role
-    name: role违反enum约束
+    name: 约束违反：role 违反 enum 约束应当被拒绝
     category: abnormal
     request:
       method: POST
@@ -107,14 +102,14 @@ operations:
       headers:
         Content-Type: application/json
       body:
-        code: DEF
-        role: superadmin
+        code: ABC
+        role: invalid_role
     assertions:
     - type: status_code
       expected: 422
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -155,22 +150,22 @@ operations:
       headers:
         Content-Type: application/json
       body:
-        model: TestDevice
-        serial: '123456789012345'
+        model: DeviceModel
+        serial: '354829012345678'
     assertions:
     - type: status_code
       expected: 201
       derived_from: spec
     requires_auth: false
     derived_from: spec
-    confidence: high
+    confidence: null
     notes: ''
     verdict: null
     assertion_verdicts: []
     note: ''
   - id: 'POST /devices :: constraint_violation:serial'
     dimension: constraint_violation:serial
-    name: 序列号格式非法
+    name: serial 格式非法
     category: abnormal
     request:
       method: POST
@@ -180,15 +175,15 @@ operations:
       headers:
         Content-Type: application/json
       body:
-        model: TestDevice
+        model: DeviceModel
         serial: invalid-imei
     assertions:
     - type: status_code
       expected: 400
-      derived_from: inferred
+      derived_from: spec
     requires_auth: false
-    derived_from: inferred
-    confidence: high
+    derived_from: spec
+    confidence: null
     notes: ''
     verdict: null
     assertion_verdicts: []
@@ -264,14 +259,14 @@ operations:
   cases:
   - id: 'GET /invoices/{invoice_id} :: value_valid'
     dimension: value_valid
-    name: 正常路径：合法发票ID查询
+    name: 正常路径：获取存在的发票详情
     category: normal
     request:
       method: GET
-      path: /invoices/inv-valid-123
+      path: /invoices/inv-123
       path_params:
-        invoice_id: inv-valid-123
-      query: null
+        invoice_id: inv-123
+      query: {}
       headers:
         Content-Type: application/json
       body: null
@@ -279,7 +274,7 @@ operations:
     - type: status_code
       expected: 200
       derived_from: spec
-    requires_auth: false
+    requires_auth: true
     derived_from: spec
     confidence: high
     notes: ''
@@ -288,14 +283,14 @@ operations:
     note: ''
   - id: 'GET /invoices/{invoice_id} :: not_found'
     dimension: not_found
-    name: 异常路径：不存在的资源返回404
+    name: 异常路径：请求不存在的发票返回 404
     category: abnormal
     request:
       method: GET
       path: /invoices/non-existent-id
       path_params:
         invoice_id: non-existent-id
-      query: null
+      query: {}
       headers:
         Content-Type: application/json
       body: null
@@ -303,7 +298,7 @@ operations:
     - type: status_code
       expected: 404
       derived_from: spec
-    requires_auth: false
+    requires_auth: true
     derived_from: spec
     confidence: high
     notes: ''
@@ -312,14 +307,14 @@ operations:
     note: ''
   - id: 'GET /invoices/{invoice_id} :: status:400'
     dimension: status:400
-    name: 异常路径：非法参数格式返回400
+    name: 异常路径：参数格式错误返回 400
     category: abnormal
     request:
       method: GET
       path: /invoices/invalid-format!@#
       path_params:
         invoice_id: invalid-format!@#
-      query: null
+      query: {}
       headers:
         Content-Type: application/json
       body: null
@@ -327,7 +322,7 @@ operations:
     - type: status_code
       expected: 400
       derived_from: spec
-    requires_auth: false
+    requires_auth: true
     derived_from: spec
     confidence: high
     notes: ''
@@ -336,15 +331,15 @@ operations:
     note: ''
   - id: 'GET /invoices/{invoice_id} :: status:401'
     dimension: status:401
-    name: 异常路径：未认证访问返回401
+    name: 异常路径：未认证访问返回 401
     category: abnormal
     request:
       method: GET
       path: /invoices/inv-123
       path_params:
         invoice_id: inv-123
-      query: null
-      headers: {}
+      query: {}
+      headers: null
       body: null
     assertions:
     - type: status_code
@@ -359,14 +354,14 @@ operations:
     note: ''
   - id: 'GET /invoices/{invoice_id} :: status:409'
     dimension: status:409
-    name: 异常路径：状态冲突返回409
+    name: 异常路径：资源状态冲突返回 409
     category: abnormal
     request:
       method: GET
-      path: /invoices/inv-conflict-status
+      path: /invoices/inv-conflict-state
       path_params:
-        invoice_id: inv-conflict-status
-      query: null
+        invoice_id: inv-conflict-state
+      query: {}
       headers:
         Content-Type: application/json
       body: null
@@ -374,7 +369,7 @@ operations:
     - type: status_code
       expected: 409
       derived_from: spec
-    requires_auth: false
+    requires_auth: true
     derived_from: spec
     confidence: high
     notes: ''
@@ -410,14 +405,14 @@ operations:
   cases:
   - id: 'GET /items/{item_id} :: value_valid'
     dimension: value_valid
-    name: 正常路径-存在资源
+    name: GET /items/{item_id} - value_valid
     category: normal
     request:
       method: GET
       path: /items/item-123
       path_params:
         item_id: item-123
-      query: null
+      query: {}
       headers:
         Content-Type: application/json
       body: null
@@ -425,11 +420,9 @@ operations:
     - type: status_code
       expected: 200
       derived_from: spec
-    - type: json_path
-      path: $.id
-      operator: eq
-      expected: item-123
-      derived_from: inferred
+    - type: schema_valid
+      schema_ref: '200'
+      derived_from: spec
     requires_auth: false
     derived_from: spec
     confidence: high
@@ -439,25 +432,20 @@ operations:
     note: ''
   - id: 'GET /items/{item_id} :: not_found'
     dimension: not_found
-    name: 异常路径-资源不存在
+    name: GET /items/{item_id} - not_found
     category: abnormal
     request:
       method: GET
-      path: /items/non-existent-id
+      path: /items/non-existent-item
       path_params:
-        item_id: non-existent-id
-      query: null
+        item_id: non-existent-item
+      query: {}
       headers:
         Content-Type: application/json
       body: null
     assertions:
     - type: status_code
       expected: 404
-      derived_from: inferred
-    - type: json_path
-      path: $.error
-      operator: exists
-      expected: true
       derived_from: inferred
     requires_auth: false
     derived_from: inferred
@@ -514,13 +502,13 @@ operations:
   cases:
   - id: 'POST /orders :: value_valid'
     dimension: value_valid
-    name: 正常创建订单
+    name: 正常路径：提供合法 billing 和 shipping
     category: normal
     request:
       method: POST
       path: /orders
       path_params: null
-      query: {}
+      query: null
       headers:
         Content-Type: application/json
       body:
@@ -528,96 +516,81 @@ operations:
           street: 123 Main St
           city: New York
         shipping:
-          street: 456 Oak Ave
+          street: 456 Elm St
           city: Boston
     assertions:
     - type: status_code
       expected: 201
       derived_from: spec
-    - type: json_path
-      path: $.id
-      operator: exists
-      expected: true
-      derived_from: inferred
     requires_auth: false
     derived_from: spec
     confidence: high
-    notes: ''
+    notes: null
     verdict: null
     assertion_verdicts: []
     note: ''
   - id: 'POST /orders :: required_missing:billing'
     dimension: required_missing:billing
-    name: 缺少 billing 字段
+    name: 缺少必填字段 billing
     category: abnormal
     request:
       method: POST
       path: /orders
       path_params: null
-      query: {}
+      query: null
       headers:
         Content-Type: application/json
       body:
         shipping:
-          street: 456 Oak Ave
+          street: 456 Elm St
           city: Boston
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
-    - type: json_path
-      path: $.error
-      operator: exists
-      expected: true
-      derived_from: inferred
     requires_auth: false
     derived_from: spec
     confidence: high
-    notes: ''
+    notes: null
     verdict: null
     assertion_verdicts: []
     note: ''
   - id: 'POST /orders :: type_mismatch:billing'
     dimension: type_mismatch:billing
-    name: billing 类型不符
+    name: billing 类型不符（传入字符串而非对象）
     category: abnormal
     request:
       method: POST
       path: /orders
       path_params: null
-      query: {}
+      query: null
       headers:
         Content-Type: application/json
       body:
         billing: invalid_string
         shipping:
-          street: 456 Oak Ave
+          street: 456 Elm St
           city: Boston
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
-    - type: json_path
-      path: $.error
-      operator: exists
-      expected: true
-      derived_from: inferred
     requires_auth: false
     derived_from: spec
     confidence: high
-    notes: ''
+    notes: null
     verdict: null
     assertion_verdicts: []
     note: ''
   - id: 'POST /orders :: required_missing:shipping'
     dimension: required_missing:shipping
-    name: 缺少 shipping 字段
+    name: 缺少必填字段 shipping
     category: abnormal
     request:
       method: POST
       path: /orders
       path_params: null
-      query: {}
+      query: null
       headers:
         Content-Type: application/json
       body:
@@ -628,47 +601,37 @@ operations:
     - type: status_code
       expected: 400
       derived_from: spec
-    - type: json_path
-      path: $.error
-      operator: exists
-      expected: true
-      derived_from: inferred
     requires_auth: false
     derived_from: spec
     confidence: high
-    notes: ''
+    notes: null
     verdict: null
     assertion_verdicts: []
     note: ''
   - id: 'POST /orders :: type_mismatch:shipping'
     dimension: type_mismatch:shipping
-    name: shipping 类型不符
+    name: shipping 类型不符（传入字符串而非对象）
     category: abnormal
     request:
       method: POST
       path: /orders
       path_params: null
-      query: {}
+      query: null
       headers:
         Content-Type: application/json
       body:
         billing:
           street: 123 Main St
           city: New York
-        shipping: 12345
+        shipping: invalid_string
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
-    - type: json_path
-      path: $.error
-      operator: exists
-      expected: true
-      derived_from: inferred
     requires_auth: false
     derived_from: spec
     confidence: high
-    notes: ''
+    notes: null
     verdict: null
     assertion_verdicts: []
     note: ''
@@ -716,8 +679,8 @@ operations:
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -728,7 +691,7 @@ operations:
       expected: 201
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -736,13 +699,13 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:price:min'
     dimension: boundary:price:min
-    name: 边界：price 取 minimum (0)
+    name: 边界测试：price 取 minimum 的边界值应当被接受
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -753,7 +716,7 @@ operations:
       expected: 201
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -761,13 +724,13 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:price:min_over'
     dimension: boundary:price:min_over
-    name: 边界：price 越出 minimum (-1)
+    name: 边界测试：price 越出 minimum 应当被拒绝
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -778,7 +741,7 @@ operations:
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -786,13 +749,13 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:price:max'
     dimension: boundary:price:max
-    name: 边界：price 取 maximum (10000)
+    name: 边界测试：price 取 maximum 的边界值应当被接受
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -803,7 +766,7 @@ operations:
       expected: 201
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -811,13 +774,13 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:price:max_over'
     dimension: boundary:price:max_over
-    name: 边界：price 越出 maximum (10001)
+    name: 边界测试：price 越出 maximum 应当被拒绝
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -828,7 +791,7 @@ operations:
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -836,24 +799,24 @@ operations:
     note: ''
   - id: 'POST /products :: constraint_violation:quantity'
     dimension: constraint_violation:quantity
-    name: 约束：quantity 违反 multipleOf 5 (3)
+    name: 约束违反：quantity 违反 multipleOf 约束应当被拒绝
     category: abnormal
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
         price: 10.5
-        quantity: 3
+        quantity: 7
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -861,24 +824,24 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:quantity:min'
     dimension: boundary:quantity:min
-    name: 边界：quantity 取 minimum (1)
+    name: 边界测试：quantity 取 minimum 的边界值应当被接受
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
         price: 10.5
-        quantity: 1
+        quantity: 5
     assertions:
     - type: status_code
       expected: 201
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -886,24 +849,24 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:quantity:min_over'
     dimension: boundary:quantity:min_over
-    name: 边界：quantity 越出 minimum (0)
+    name: 边界测试：quantity 越出 minimum 应当被拒绝
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
         price: 10.5
-        quantity: -4
+        quantity: 0
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -911,13 +874,13 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:quantity:max'
     dimension: boundary:quantity:max
-    name: 边界：quantity 取 maximum (100)
+    name: 边界测试：quantity 取 maximum 的边界值应当被接受
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -928,7 +891,7 @@ operations:
       expected: 201
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -936,13 +899,13 @@ operations:
     note: ''
   - id: 'POST /products :: boundary:quantity:max_over'
     dimension: boundary:quantity:max_over
-    name: 边界：quantity 越出 maximum (105)
+    name: 边界测试：quantity 越出 maximum 应当被拒绝
     category: boundary
     request:
       method: POST
       path: /products
-      path_params: {}
-      query: null
+      path_params: null
+      query: {}
       headers:
         Content-Type: application/json
       body:
@@ -953,7 +916,7 @@ operations:
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -988,12 +951,12 @@ operations:
   cases:
   - id: 'POST /profiles :: value_valid'
     dimension: value_valid
-    name: 正常路径：所有必填字段给合法值
+    name: 正常路径：所有必填字段给合法值，验证正常路径
     category: normal
     request:
       method: POST
       path: /profiles
-      path_params: null
+      path_params: {}
       query: {}
       headers:
         Content-Type: application/json
@@ -1012,12 +975,12 @@ operations:
     note: ''
   - id: 'POST /profiles :: boundary:bio:len_min'
     dimension: boundary:bio:len_min
-    name: 边界测试：bio取minLength=1的边界值应当被接受
+    name: bio 取 minLength 的边界值应当被接受
     category: boundary
     request:
       method: POST
       path: /profiles
-      path_params: null
+      path_params: {}
       query: {}
       headers:
         Content-Type: application/json
@@ -1036,12 +999,12 @@ operations:
     note: ''
   - id: 'POST /profiles :: boundary:bio:len_min_over'
     dimension: boundary:bio:len_min_over
-    name: 边界测试：bio越出minLength应当被拒绝
+    name: bio 越出 minLength 应当被拒绝
     category: boundary
     request:
       method: POST
       path: /profiles
-      path_params: null
+      path_params: {}
       query: {}
       headers:
         Content-Type: application/json
@@ -1060,12 +1023,12 @@ operations:
     note: ''
   - id: 'POST /profiles :: boundary:bio:len_max'
     dimension: boundary:bio:len_max
-    name: 边界测试：bio取maxLength=280的边界值应当被接受
+    name: bio 取 maxLength 的边界值应当被接受
     category: boundary
     request:
       method: POST
       path: /profiles
-      path_params: null
+      path_params: {}
       query: {}
       headers:
         Content-Type: application/json
@@ -1084,12 +1047,12 @@ operations:
     note: ''
   - id: 'POST /profiles :: boundary:bio:len_max_over'
     dimension: boundary:bio:len_max_over
-    name: 边界测试：bio越出maxLength应当被拒绝
+    name: bio 越出 maxLength 应当被拒绝
     category: boundary
     request:
       method: POST
       path: /profiles
-      path_params: null
+      path_params: {}
       query: {}
       headers:
         Content-Type: application/json
@@ -1128,7 +1091,7 @@ operations:
   cases:
   - id: 'GET /reports/summary :: value_valid'
     dimension: value_valid
-    name: 正常路径-查询维度为day
+    name: GET /reports/summary with valid dimension=day
     category: normal
     request:
       method: GET
@@ -1143,11 +1106,8 @@ operations:
     - type: status_code
       expected: 200
       derived_from: spec
-    - type: body_contains
-      text: ''
-      derived_from: inferred
     requires_auth: false
-    derived_from: spec
+    derived_from: inferred
     confidence: high
     notes: ''
     verdict: null
@@ -1194,24 +1154,24 @@ operations:
   cases:
   - id: 'POST /users :: value_valid'
     dimension: value_valid
-    name: 正常创建用户
+    name: 正常路径：所有必填字段给合法值
     category: normal
     request:
       method: POST
       path: /users
-      path_params: {}
+      path_params: null
       query: null
       headers:
         Content-Type: application/json
       body:
+        email: test@example.com
         name: Alice
-        email: alice@example.com
     assertions:
     - type: status_code
       expected: 201
       derived_from: spec
     requires_auth: false
-    derived_from: inferred
+    derived_from: spec
     confidence: high
     notes: ''
     verdict: null
@@ -1219,12 +1179,12 @@ operations:
     note: ''
   - id: 'POST /users :: required_missing:email'
     dimension: required_missing:email
-    name: 缺少必填字段 email
+    name: 缺少必填字段 email 应当被拒绝
     category: abnormal
     request:
       method: POST
       path: /users
-      path_params: {}
+      path_params: null
       query: null
       headers:
         Content-Type: application/json
@@ -1235,7 +1195,7 @@ operations:
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: inferred
+    derived_from: spec
     confidence: high
     notes: ''
     verdict: null
@@ -1243,24 +1203,24 @@ operations:
     note: ''
   - id: 'POST /users :: type_mismatch:email'
     dimension: type_mismatch:email
-    name: email 类型不符
+    name: email 的类型不符应当被拒绝
     category: abnormal
     request:
       method: POST
       path: /users
-      path_params: {}
+      path_params: null
       query: null
       headers:
         Content-Type: application/json
       body:
-        name: Charlie
         email: 12345
+        name: Charlie
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: inferred
+    derived_from: spec
     confidence: high
     notes: ''
     verdict: null
@@ -1268,23 +1228,23 @@ operations:
     note: ''
   - id: 'POST /users :: required_missing:name'
     dimension: required_missing:name
-    name: 缺少必填字段 name
+    name: 缺少必填字段 name 应当被拒绝
     category: abnormal
     request:
       method: POST
       path: /users
-      path_params: {}
+      path_params: null
       query: null
       headers:
         Content-Type: application/json
       body:
-        email: dave@example.com
+        email: bob@example.com
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: inferred
+    derived_from: spec
     confidence: high
     notes: ''
     verdict: null
@@ -1292,24 +1252,24 @@ operations:
     note: ''
   - id: 'POST /users :: type_mismatch:name'
     dimension: type_mismatch:name
-    name: name 类型不符
+    name: name 的类型不符应当被拒绝
     category: abnormal
     request:
       method: POST
       path: /users
-      path_params: {}
+      path_params: null
       query: null
       headers:
         Content-Type: application/json
       body:
         name: 999
-        email: eve@example.com
+        email: charlie@example.com
     assertions:
     - type: status_code
       expected: 400
       derived_from: spec
     requires_auth: false
-    derived_from: inferred
+    derived_from: spec
     confidence: high
     notes: ''
     verdict: null

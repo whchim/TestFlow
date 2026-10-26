@@ -91,6 +91,7 @@ def validate_generation(
         *_validate_path_params(operation_path, result),
         *_validate_schema_refs(responses_schema, result),
         *_validate_boundary_values(request_body_schema, result),
+        *_validate_assertion_content(result),
     ]
     return ValidationResult(tuple(issues))
 
@@ -331,6 +332,40 @@ def _response_has_content_schema(responses_schema: dict[str, Any] | None, status
     if not isinstance(content, dict):
         return False
     return any(isinstance(media, dict) and "schema" in media for media in content.values())
+
+
+def _validate_assertion_content(result: GenerationResult) -> list[ValidationIssue]:
+    """断言本身必须有实际内容。
+
+    `body_contains: ""`、`json_path: ""` 这类断言要么恒真、要么无法求值，
+    会让一条用例看起来"有断言"，实际上什么都没验证。M5 第二轮标注里
+    `/reports/summary` 就是被一个空的 `body_contains` 判成错误的。
+    """
+    issues: list[ValidationIssue] = []
+    for index, case in enumerate(result.cases):
+        for assertion in case.assertions:
+            empty = False
+            if assertion.type == "body_contains":
+                empty = not str(getattr(assertion, "text", "") or "").strip()
+            elif assertion.type == "json_path":
+                empty = not str(getattr(assertion, "path", "") or "").strip()
+            elif assertion.type == "header":
+                empty = not str(getattr(assertion, "name", "") or "").strip()
+
+            if empty:
+                issues.append(
+                    ValidationIssue(
+                        layer=IssueLayer.L1,
+                        code="l1.assertion_empty_value",
+                        message=(
+                            f"第 {index + 1} 条用例的 `{assertion.type}` 断言内容为空，"
+                            "它无法验证任何东西"
+                        ),
+                        dimension=case.dimension,
+                        case_index=index,
+                    )
+                )
+    return issues
 
 
 def _validate_boundary_values(

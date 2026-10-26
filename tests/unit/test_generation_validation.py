@@ -180,6 +180,34 @@ def test_max_over_must_respect_multiple_of() -> None:
     assert "l1.boundary_value_mismatch" not in _codes(good)
 
 
+def test_empty_body_contains_assertion_is_reported() -> None:
+    result = _validate(
+        [
+            _case(
+                "value_valid",
+                assertions=[{"type": "body_contains", "text": "", "derived_from": "inferred"}],
+            )
+        ],
+        requested=[_dim("value_valid")],
+    )
+
+    assert "l1.assertion_empty_value" in _codes(result)
+
+
+def test_non_empty_body_contains_assertion_is_allowed() -> None:
+    result = _validate(
+        [
+            _case(
+                "value_valid",
+                assertions=[{"type": "body_contains", "text": "ok", "derived_from": "inferred"}],
+            )
+        ],
+        requested=[_dim("value_valid")],
+    )
+
+    assert "l1.assertion_empty_value" not in _codes(result)
+
+
 def test_non_boundary_dimensions_are_ignored_by_the_boundary_check() -> None:
     schema = _body({"bio": {"type": "string", "maxLength": 280}})
     result = _validate(

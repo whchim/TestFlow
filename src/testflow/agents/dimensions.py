@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from testflow.domain.cases import DimensionSpec
@@ -153,12 +154,28 @@ def boundary_target(field_schema: dict[str, Any], tag: str) -> tuple[str, float]
         base = field_schema.get(key)
         if not isinstance(base, (int, float)) or isinstance(base, bool):
             return None
-        step = field_schema.get("multipleOf")
-        if not isinstance(step, (int, float)) or isinstance(step, bool) or step <= 0:
-            step = 1
-        if tag.endswith("_over"):
-            base = base - step if tag.startswith("min") else base + step
-        return ("value", float(base))
+
+        multiple = field_schema.get("multipleOf")
+        if isinstance(multiple, (int, float)) and not isinstance(multiple, bool) and multiple > 0:
+            step = float(multiple)
+            # 有 multipleOf 时，边界值也必须是它的整数倍，否则会同时违反
+            # 两个约束，无法单独验证当前维度。
+            if tag == "min":
+                value = math.ceil(base / step) * step
+            elif tag == "min_over":
+                value = math.floor((base - 1) / step) * step
+            elif tag == "max":
+                value = math.floor(base / step) * step
+            else:
+                value = math.ceil((base + 1) / step) * step
+        else:
+            value = base
+            if tag == "min_over":
+                value -= 1
+            elif tag == "max_over":
+                value += 1
+
+        return ("value", float(value))
 
     return None
 

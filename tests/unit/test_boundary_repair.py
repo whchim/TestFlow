@@ -7,6 +7,7 @@ M5 人工标注发现：模型会把 `maxLength=280` 写成 252/254 个字符，
 
 from __future__ import annotations
 
+from testflow.agents.dimensions import boundary_target
 from testflow.agents.llm_case_gen import repair_boundary_values
 from testflow.domain.assertions import StatusCodeAssertion
 from testflow.domain.cases import GeneratedCase, GenerationResult
@@ -55,6 +56,26 @@ def test_len_min_over_can_be_empty() -> None:
     assert fixed.request_body["bio"] == ""
 
 
+def test_min_respects_multiple_of() -> None:
+    """minimum=1、multipleOf=5 时，最小合法值是 5，不是 1。"""
+    fixed = _repair(
+        _case("boundary:quantity:min", {"quantity": 1}),
+        _PRODUCT,
+    )
+
+    assert fixed.request_body["quantity"] == 5
+
+
+def test_min_over_respects_multiple_of() -> None:
+    """小于 minimum 且仍是 multipleOf 的整数倍，才能单独验证下界。"""
+    fixed = _repair(
+        _case("boundary:quantity:min_over", {"quantity": -4}),
+        _PRODUCT,
+    )
+
+    assert fixed.request_body["quantity"] == 0
+
+
 def test_max_over_respects_multiple_of() -> None:
     fixed = _repair(
         _case("boundary:quantity:max_over", {"quantity": 101}),
@@ -62,6 +83,15 @@ def test_max_over_respects_multiple_of() -> None:
     )
 
     assert fixed.request_body["quantity"] == 105
+
+
+def test_boundary_target_without_multiple_of() -> None:
+    schema = {"minimum": 1, "maximum": 100}
+
+    assert boundary_target(schema, "min") == ("value", 1.0)
+    assert boundary_target(schema, "min_over") == ("value", 0.0)
+    assert boundary_target(schema, "max") == ("value", 100.0)
+    assert boundary_target(schema, "max_over") == ("value", 101.0)
 
 
 def test_correct_values_are_left_alone() -> None:
