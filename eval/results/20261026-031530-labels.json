@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-10-26T03:15:30.788438+00:00",
+  "sheet": "eval\\labels\\golden-set-cases-round2-labeled.yaml",
+  "model": "qwen3.7-flash",
+  "golden_set_sha256": "929e062e3f9f61d31acab85d2ef9d92517e6a8451539489c82ee06c113a26911",
+  "total_cases": 39,
+  "case_accuracy": 0.8846153846153846,
+  "cases": {
+    "correct": 23,
+    "incorrect": 3,
+    "skipped": 13,
+    "unlabeled": 0,
+    "accuracy": 0.8846153846153846
+  },
+  "assertion_accuracy": 0.9428571428571428,
+  "assertions": {
+    "labeled": 35,
+    "correct": 33
+  },
+  "by_operation": {
+    "POST /accounts": {
+      "correct": 2,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "POST /devices": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 2,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "GET /health": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "GET /invoices/{invoice_id}": {
+      "correct": 3,
+      "incorrect": 0,
+      "skipped": 2,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "GET /items/{item_id}": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 2,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "POST /orders": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 5,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "POST /products": {
+      "correct": 8,
+      "incorrect": 2,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 0.8
+    },
+    "POST /profiles": {
+      "correct": 5,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "GET /reports/summary": {
+      "correct": 0,
+      "incorrect": 1,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 0.0
+    },
+    "POST /users": {
+      "correct": 5,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    }
+  },
+  "by_dimension": {
+    "value_valid": {
+      "correct": 4,
+      "incorrect": 1,
+      "skipped": 5,
+      "unlabeled": 0,
+      "accuracy": 0.8
+    },
+    "constraint_violation:code": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "constraint_violation:role": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "constraint_violation:serial": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "not_found": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "status:400": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "status:401": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "status:409": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "required_missing:billing": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "type_mismatch:billing": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "required_missing:shipping": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "type_mismatch:shipping": {
+      "correct": 0,
+      "incorrect": 0,
+      "skipped": 1,
+      "unlabeled": 0,
+      "accuracy": null
+    },
+    "boundary:price:min": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:price:min_over": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:price:max": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:price:max_over": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "constraint_violation:quantity": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:quantity:min": {
+      "correct": 0,
+      "incorrect": 1,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 0.0
+    },
+    "boundary:quantity:min_over": {
+      "correct": 0,
+      "incorrect": 1,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 0.0
+    },
+    "boundary:quantity:max": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:quantity:max_over": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:bio:len_min": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:bio:len_min_over": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:bio:len_max": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "boundary:bio:len_max_over": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "required_missing:email": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "type_mismatch:email": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "required_missing:name": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    },
+    "type_mismatch:name": {
+      "correct": 1,
+      "incorrect": 0,
+      "skipped": 0,
+      "unlabeled": 0,
+      "accuracy": 1.0
+    }
+  },
+  "generation_failures": []
+}
