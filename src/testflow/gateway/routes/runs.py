@@ -328,18 +328,19 @@ async def submit_decisions(run_id: str, payload: DecisionRequest, request: Reque
     "/{run_id}/report",
     dependencies=[Depends(require_user_token)],
     summary="取报告（JSON 或 Markdown）",
-    # `response_model=None`：这个端点按 `Accept` 返回两种内容类型，
-    # 而 FastAPI 不接受 `JSONResponse | PlainTextResponse` 作为响应模型。
-    # 两种形态在 `responses` 里显式声明——**契约不能因为注解写不了就消失**。
-    response_model=None,
+    # ★ 用 `response_model=ReportResponse` 而不是 `None`：
+    # 端点按 `Accept` 返回两种内容类型，返回 Markdown 时是 `PlainTextResponse`
+    # （FastAPI 对 Response 实例跳过校验）。声明 response_model 的唯一目的是
+    # 让 ReportResponse 进入 `components.schemas`——否则手动写在 `responses`
+    # 里的 `$ref` 会悬空，而解析器会（正确地）拒绝这种文档。
+    response_model=ReportResponse,
     responses={
         200: {
             "description": "报告内容。`application/json` 返回结构化数据，"
             "`text/markdown` 返回写入时的渲染快照（RA4）。",
-            "content": {
-                "application/json": {"schema": {"$ref": "#/components/schemas/ReportResponse"}},
-                "text/markdown": {"schema": {"type": "string"}},
-            },
+            # `response_model` 已经生成了 application/json 的 schema；
+            # 这里只补第二种内容类型。
+            "content": {"text/markdown": {"schema": {"type": "string"}}},
         },
         404: {"description": "报告尚未生成（`problem+json`，`code=report_not_ready`）"},
     },

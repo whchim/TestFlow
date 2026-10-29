@@ -507,6 +507,26 @@
         "title": "ReadinessResponse",
         "type": "object"
       },
+      "ReportResponse": {
+        "description": "报告的 JSON 形式。\n\n`Accept: text/markdown` 时返回 `rendered` 那一段 Markdown 原文\n（快照，非重渲染——RA4）。",
+        "properties": {
+          "content": {
+            "additionalProperties": true,
+            "title": "Content",
+            "type": "object"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "content"
+        ],
+        "title": "ReportResponse",
+        "type": "object"
+      },
       "RunCreatedResponse": {
         "properties": {
           "phase": {
